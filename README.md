@@ -4,7 +4,7 @@ Hit counters for the [Omarchy](https://omarchy.org/) bar. Remember the visitor
 counter at the bottom of every home page? This is that, for the numbers you
 care about today: YouTube channel subscribers, video likes and views, GitHub
 stars, open issues, pull requests and unique cloners, Mastodon followers,
-posts and hashtag activity — and any other number, since every source is one
+posts and hashtag activity — and more are coming, since every source is one
 small file.
 
 The bar shows `󰗃 12.3K  󰔓 1.2K  󰓎 340  󰇚 51  󰫑 2.1K` in the order you
