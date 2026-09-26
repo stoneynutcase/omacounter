@@ -270,7 +270,8 @@ Panel {
   }
 
   function openCounter(counter) {
-    if (counter && counter.url) Util.execArgv(["xdg-open", counter.url])
+    // By absolute path: the shell's PATH is the session's, not ours.
+    if (counter && counter.url) Util.execArgv(["/usr/bin/xdg-open", counter.url])
   }
 
   function notifySummary() {
@@ -605,10 +606,36 @@ Panel {
     exitCode = 0
     var argv = [cliPath, "fetch", "--counters", countersJson, "--max-age", String(refreshMinutes)]
     if (force) argv.push("--force")
-    // Through sh: handing Quickshell a nonexistent binary can abort the shell
-    // inside the failed start. sh always starts; a failed exec is exit 126/127.
-    fetchProc.command = ["/bin/sh", "-c", 'exec "$0" "$@"'].concat(argv)
+    // Through sh, so a missing interpreter is exit 127 rather than a failed
+    // start that can take the shell down; the interpreter itself is the
+    // system's python by absolute path, never whatever PATH would find.
+    fetchProc.command = ["/bin/sh", "-c", 'exec /usr/bin/python3 "$@"', "sh"].concat(argv)
     fetchProc.running = true
+  }
+
+  // The CLI is started with the shell's environment cleared and only this
+  // handed over: a fixed PATH, the locale, the home and XDG directories,
+  // proxy settings, and the variables a credential may be given in. The
+  // shell was started by a desktop session with whatever that session had
+  // (a loader override, a PATH with a stranger's python first); none of it
+  // reaches a process that handles an API key.
+  readonly property var childEnv: buildChildEnv()
+
+  function buildChildEnv() {
+    var keep = [
+      "HOME", "USER", "LANG", "LC_ALL",
+      "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR",
+      "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+      "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+      "OMARCHY_PATH",
+      "YOUTUBE_API_KEY", "GITHUB_TOKEN", "GH_TOKEN", "GH_CONFIG_DIR", "GH_HOST"
+    ]
+    var env = { "PATH": "/usr/local/bin:/usr/bin:/bin" }
+    for (var i = 0; i < keep.length; i++) {
+      var value = Quickshell.env(keep[i])
+      if (value) env[keep[i]] = String(value)
+    }
+    return env
   }
 
   function maybeFinalize() {
@@ -654,6 +681,8 @@ Panel {
 
   Process {
     id: fetchProc
+    clearEnvironment: true
+    environment: root.childEnv
     onRunningChanged: {
       if (running) return
       root.processDone = true

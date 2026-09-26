@@ -10,16 +10,117 @@ the registry and drives everything from these attributes and methods.
 """
 
 import json
+import os
 import re
 import socket
+import stat
 import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 USER_AGENT = "omacounter/" + VERSION + " (+https://github.com/stoneynutcase/omacounter)"
 HTTP_TIMEOUT = 10
 MAX_RESPONSE_BYTES = 1024 * 1024
+MAX_REDIRECTS = 3
+
+
+# ------------------------------------------------------------ trusted helpers
+# The programs this plugin starts on its own (the `gh` CLI for a token,
+# `gum` for the wizard, `xdg-open`, Omarchy's own commands) are taken from
+# the system directories by absolute path, and only when root owns the file
+# and nobody else can write it. `PATH` is not consulted: ~/.local/bin is on
+# most shells' PATH, and that is where anything able to write into the home
+# directory would put a `gh` of its own. Omarchy's commands live in its
+# install directory, held to the same rule.
+
+TRUSTED_DIRS = ("/usr/local/bin", "/usr/bin", "/bin")
+FIXED_PATH = ":".join(TRUSTED_DIRS)
+OMARCHY_BIN = os.path.join(os.environ.get("OMARCHY_PATH") or "/usr/share/omarchy", "bin")
+PYTHON = "/usr/bin/python3"
+
+
+def _root_owned(st):
+    return st.st_uid == 0 and not st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+
+
+def trusted_file(path, depth=0):
+    """True when `path` is an executable regular file that root owns and
+    nobody else can write, reached only through symlinks root owns that
+    stay inside the trusted directories."""
+    if depth > 8:
+        return False
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        # Permission bits on a symlink mean nothing on Linux: ownership is
+        # the whole check. /usr/bin/python3 is a link to whichever version
+        # is installed today.
+        if st.st_uid != 0:
+            return False
+        target = os.readlink(path)
+        if not os.path.isabs(target):
+            target = os.path.join(os.path.dirname(path), target)
+        target = os.path.normpath(target)
+        dirs = TRUSTED_DIRS + (OMARCHY_BIN,)
+        if not any(target == d or target.startswith(d + "/") for d in dirs):
+            return False
+        return trusted_file(target, depth + 1)
+    return bool(stat.S_ISREG(st.st_mode) and _root_owned(st) and st.st_mode & 0o111)
+
+
+_TOOL_CACHE = {}
+
+
+def trusted_tool(name, omarchy=False):
+    """Absolute path of helper `name` in the trusted directories (Omarchy's
+    own bin directory when `omarchy` is set), or None when there is no such
+    file that passes `trusted_file`."""
+    key = (name, omarchy)
+    if key in _TOOL_CACHE:
+        return _TOOL_CACHE[key]
+    found = None
+    for directory in ((OMARCHY_BIN,) if omarchy else TRUSTED_DIRS):
+        try:
+            st = os.stat(directory)
+        except OSError:
+            continue
+        if not stat.S_ISDIR(st.st_mode) or not _root_owned(st):
+            continue
+        candidate = os.path.join(directory, name)
+        if trusted_file(candidate):
+            found = candidate
+            break
+    _TOOL_CACHE[key] = found
+    return found
+
+
+def minimal_env(keep=()):
+    """An environment for a helper started on the plugin's behalf: a fixed
+    PATH, the locale, the home and XDG directories, proxy settings, and
+    whatever `keep` names beyond those. Nothing else survives, so a loader
+    or trust override in the session cannot reach the helper."""
+    names = ("HOME", "USER", "LANG", "LC_ALL", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME",
+             "XDG_RUNTIME_DIR", "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+             "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY") + tuple(keep)
+    env = {"PATH": FIXED_PATH}
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            env[name] = value
+    return env
+
+
+def scrub(text, secrets):
+    """`text` with every value in `secrets` replaced, so a key never rides
+    along in an error message, a report or a log."""
+    out = str(text or "")
+    for value in secrets:
+        if value and len(str(value)) >= 8:
+            out = out.replace(str(value), "•••")
+    return out
 
 
 # --------------------------------------------------------------------- errors
@@ -53,14 +154,33 @@ class Result:
 # ----------------------------------------------------------------------- http
 
 
+class HttpsOnlyRedirects(urllib.request.HTTPRedirectHandler):
+    """Follow a redirect only to another https URL, and only a few times.
+    Python's default would happily step down to plain http."""
+
+    max_repeats = 2
+    max_redirections = MAX_REDIRECTS
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urllib.parse.urlsplit(newurl).scheme != "https":
+            raise CounterError("redirect to a non-https address refused")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(HttpsOnlyRedirects())
+
+
 def http_json(url, timeout=HTTP_TIMEOUT, headers=None):
-    """GET a JSON document. The URL may carry an API key as a query parameter;
-    the request is made in-process, so it never shows up in a command line."""
+    """GET a JSON document over https. The URL may carry an API key as a
+    query parameter; the request is made in-process, so it never shows up in
+    a command line, and the caller scrubs the key from any error text."""
+    if urllib.parse.urlsplit(url).scheme != "https":
+        raise CounterError("only https addresses are fetched")
     merged = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     merged.update(headers or {})
     request = urllib.request.Request(url, headers=merged)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _OPENER.open(request, timeout=timeout) as response:
             raw = response.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as error:
         body = b""
@@ -68,6 +188,8 @@ def http_json(url, timeout=HTTP_TIMEOUT, headers=None):
             body = error.read(MAX_RESPONSE_BYTES)
         except OSError:
             pass
+        finally:
+            error.close()
         message, reason = "", ""
         try:
             parsed = json.loads(body)

@@ -10,11 +10,10 @@ limit to 5,000 an hour. The `gh` CLI's login counts as a token, so a
 machine where `gh auth login` has been run needs nothing stored."""
 
 import re
-import shutil
 import subprocess
 import urllib.parse
 
-from providers.base import CounterError, Credential, HttpError, http_json, parse_url
+from providers.base import CounterError, Credential, HttpError, http_json, minimal_env, parse_url, trusted_tool
 
 API = "https://api.github.com"
 HEADERS = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
@@ -32,14 +31,19 @@ CLONE_COLOR = "#58A6FF"   # GitHub's link blue
 
 
 def gh_cli_token():
-    """The token the `gh` CLI is logged in with, or "". One subprocess per
-    fetch run is acceptable; the result is cached for the process."""
+    """The token the `gh` CLI is logged in with, or "". Only a `gh` that
+    root installed in the system directories is run (see base.trusted_tool),
+    with a minimal environment that still lets it find its own config; one
+    subprocess per fetch run is acceptable, and the result is cached for the
+    process."""
     if gh_cli_token.cached is not None:
         return gh_cli_token.cached
     token = ""
-    if shutil.which("gh"):
+    gh = trusted_tool("gh")
+    if gh:
         try:
-            result = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, timeout=5)
+            result = subprocess.run([gh, "auth", "token"], capture_output=True, text=True, timeout=5,
+                                    env=minimal_env(("GH_CONFIG_DIR", "GH_HOST")))
             if result.returncode == 0:
                 token = result.stdout.strip()
         except (subprocess.SubprocessError, OSError):

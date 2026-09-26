@@ -48,6 +48,28 @@ keys its rows and cards by position (number models, not the report array) so
 a fetch that changes a value flips only the digits that changed instead of
 rebuilding the row.
 
+### Helpers, environment and the network
+
+Rules that hold across the CLI and the panel, and that the marketplace's
+review checks against the README's "What it touches" section:
+
+- A helper (`gh`, `gum`, `xdg-open`, Omarchy's commands) is run only by the
+  absolute path `providers/base.py` `trusted_tool` returns: a root-owned,
+  not-otherwise-writable file in `/usr/local/bin`, `/usr/bin`, `/bin` or
+  Omarchy's bin directory, reached through root-owned symlinks only. Never
+  `shutil.which`, never a bare name.
+- The panel starts the CLI as `/usr/bin/python3 <cli>` with
+  `clearEnvironment: true` and the allowlist in `buildChildEnv`; the CLI's
+  shebang is `/usr/bin/python3`. Automatic subprocesses (`gh auth token`)
+  get `minimal_env()`.
+- All fetching goes through `http_json`: https only, https-only redirects
+  capped at `MAX_REDIRECTS`, `MAX_RESPONSE_BYTES`, `HTTP_TIMEOUT`. A
+  provider never opens a socket itself.
+- A credential is never an argument: `auth … set` prompts or reads stdin,
+  and `fetch_all` scrubs every held credential from error text.
+- Files are written with `write_json` (random temp name, rename into place);
+  the secrets and the cache are read with `nofollow`.
+
 ### When fetches happen
 
 Two timers in `Panel.qml`, both cheap because the CLI serves anything not
@@ -325,8 +347,20 @@ Shell log: `journalctl --user -o cat _COMM=quickshell`.
 
 ```bash
 python3 -m unittest discover -s test -v     # the CLI and providers, offline
-node --test test/                            # Model.js
+node --test "test/*.test.mjs"                            # Model.js
+
+# Live, against the real services (what .github/workflows/integration.yml runs
+# daily and on every change to providers/, bin/ or test/):
+OMACOUNTER_LIVE=1 python3 -m unittest discover -s test -p test_cli.py -k LiveKeyless -v
+YOUTUBE_API_KEY=… python3 -m unittest discover -s test -p test_cli.py -k LiveYouTube -v
 ```
+
+The keyed job takes the key from the repository secret `YOUTUBE_API_KEY`;
+a pull request from a fork gets no secret and the YouTube tests skip rather
+than fail. The keyless job runs with the workflow's own `GITHUB_TOKEN` so
+GitHub's unauthenticated limit does not bite on a shared runner address. A
+failing scheduled run opens (or comments on) an issue titled "Daily
+integration run is failing".
 
 Nothing to install. The Python tests load `bin/omacounter` as a module,
 which puts the plugin root on `sys.path` so `providers` is the same package

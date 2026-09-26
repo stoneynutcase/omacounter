@@ -19,6 +19,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import urllib.request
 from contextlib import redirect_stdout
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -851,7 +852,18 @@ class Credentials(Sandbox):
         youtube.YouTubeKey.verify = lambda self, value: None
         self.write_shell([{"type": "youtube.likes", "target": "dQw4w9WgXcQ"}])
         os.environ.pop("YOUTUBE_API_KEY", None)
-        code, out = self.run_cli(["auth", "youtube", "set", "k" * 30])
+        # The key is never taken from the command line: piped in instead.
+        with self.assertRaises(SystemExit):
+            self.run_cli(["auth", "youtube", "set", "k" * 30])
+        with self.assertRaises(SystemExit) as caught:
+            self.run_cli(["auth", "youtube", "set"])   # no terminal in a test, no --stdin
+        self.assertEqual(caught.exception.code, 64)
+        saved_stdin = sys.stdin
+        sys.stdin = io.StringIO("k" * 30 + "\n")
+        try:
+            code, out = self.run_cli(["auth", "youtube", "set", "--stdin"])
+        finally:
+            sys.stdin = saved_stdin
         self.assertEqual(code, 0)
         self.assertEqual(cli.load_secrets(), {"youtube": {"apiKey": "k" * 30}})
         code, out = self.run_cli(["auth", "youtube", "show"])
@@ -868,6 +880,76 @@ class Credentials(Sandbox):
         self.assertEqual(caught.exception.code, 64)
 
 
+# ------------------------------------------------------------------ hardening
+
+
+class Hardening(Sandbox):
+    def test_trusted_tool_ignores_the_users_path(self):
+        # A helper is found only in the system directories, root-owned.
+        sh = base.trusted_tool("sh")
+        self.assertIn(sh, ("/usr/local/bin/sh", "/usr/bin/sh", "/bin/sh"))
+        self.assertTrue(base.trusted_file(sh))
+        planted = os.path.join(self.tmp, "gh")
+        with open(planted, "w") as fh:
+            fh.write("#!/bin/sh\necho stolen\n")
+        os.chmod(planted, 0o755)
+        saved = os.environ.get("PATH", "")
+        os.environ["PATH"] = self.tmp + ":" + saved
+        self.addCleanup(os.environ.__setitem__, "PATH", saved)
+        self.assertEqual(shutil.which("gh"), planted)
+        base._TOOL_CACHE.clear()
+        self.assertNotEqual(base.trusted_tool("gh"), planted)
+        self.assertIsNone(base.trusted_tool("no-such-helper-xyz"))
+        self.assertFalse(base.trusted_file(planted))
+
+    def test_minimal_env(self):
+        os.environ["LD_PRELOAD"] = "/tmp/evil.so"
+        os.environ["HOME"] = "/home/someone"
+        self.addCleanup(os.environ.pop, "LD_PRELOAD", None)
+        env = base.minimal_env(("GH_CONFIG_DIR",))
+        self.assertEqual(env["PATH"], "/usr/local/bin:/usr/bin:/bin")
+        self.assertEqual(env["HOME"], "/home/someone")
+        self.assertNotIn("LD_PRELOAD", env)
+        self.assertNotIn("SSL_CERT_FILE", env)
+
+    def test_only_https_and_https_redirects(self):
+        with self.assertRaises(cli.CounterError):
+            base.http_json("http://api.github.com/repos/o/r")
+        handler = base.HttpsOnlyRedirects()
+        req = urllib.request.Request("https://example.test/a")
+        with self.assertRaises(cli.CounterError):
+            handler.redirect_request(req, None, 302, "Found", {}, "http://example.test/b")
+        moved = handler.redirect_request(req, None, 302, "Found", {}, "https://example.test/b")
+        self.assertEqual(moved.full_url, "https://example.test/b")
+        self.assertEqual(base.MAX_REDIRECTS, 3)
+
+    def test_errors_are_scrubbed_of_credentials(self):
+        self.assertEqual(base.scrub("key AIzaSyEXAMPLEKEY0123 rejected", ["AIzaSyEXAMPLEKEY0123"]), "key ••• rejected")
+        self.assertEqual(base.scrub("short", ["ab"]), "short")   # a tiny value would blank real words
+        os.environ["YOUTUBE_API_KEY"] = "secret-key-0123456789"
+        self.addCleanup(os.environ.pop, "YOUTUBE_API_KEY", None)
+        self.fake("youtube.likes", lambda t, s: (_ for _ in ()).throw(cli.CounterError("bad request for key=secret-key-0123456789")))
+        row = cli.fetch_all([{"type": "youtube.likes", "target": "dQw4w9WgXcQ"}], now=0)["counters"][0]
+        self.assertEqual(row["error"], "bad request for key=•••")
+        self.assertNotIn("secret-key", row["tooltip"])
+
+    def test_secrets_and_state_are_not_read_through_a_symlink(self):
+        elsewhere = os.path.join(self.tmp, "elsewhere.json")
+        with open(elsewhere, "w") as fh:
+            json.dump({"youtube": {"apiKey": "k" * 30}}, fh)
+        os.makedirs(os.path.dirname(cli.SECRETS_PATH), exist_ok=True)
+        os.symlink(elsewhere, cli.SECRETS_PATH)
+        self.assertEqual(cli.load_secrets(), {})
+        os.unlink(cli.SECRETS_PATH)
+        cli.save_secrets({"youtube": {"apiKey": "k" * 30}})
+        self.assertEqual(cli.load_secrets(), {"youtube": {"apiKey": "k" * 30}})
+
+    def test_add_does_not_enable_the_widget_unasked(self):
+        self.write_shell(present=False)
+        with self.assertRaises(SystemExit):
+            self.run_cli(["add", "github.stars", "octocat/Hello-World", "--no-verify"])
+
+
 # ----------------------------------------------------------------------- live
 
 
@@ -882,10 +964,45 @@ class LiveYouTube(unittest.TestCase):
         result = cli.PROVIDERS["youtube.likes"].fetch("dQw4w9WgXcQ", {})
         self.assertGreater(result.value, 1_000_000)
 
+    def test_views(self):
+        result = cli.PROVIDERS["youtube.views"].fetch("dQw4w9WgXcQ", {})
+        self.assertGreater(result.value, 1_000_000_000)
+        self.assertEqual(result.url, "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+
+    def test_key_is_accepted(self):
+        youtube.CREDENTIAL.verify(os.environ["YOUTUBE_API_KEY"])
+
     def test_rejected_key_is_reported(self):
         with self.assertRaises(cli.CounterError) as caught:
             youtube.CREDENTIAL.verify("AIzaNotARealKey0000000000000000000000")
         self.assertIn("rejected", str(caught.exception))
+
+    def test_missing_channel_and_video(self):
+        with self.assertRaises(cli.CounterError) as caught:
+            cli.PROVIDERS["youtube.subscribers"].fetch("@no-such-channel-xyz-987654", {})
+        self.assertIn("not found", str(caught.exception))
+        with self.assertRaises(cli.CounterError) as caught:
+            cli.PROVIDERS["youtube.likes"].fetch("zzzzzzzzzzz", {})
+        self.assertIn("not found", str(caught.exception))
+
+    def test_end_to_end_report(self):
+        # The fetch loop as the panel runs it: cache in a temp dir, one key
+        # from the environment, a report row per counter.
+        tmp = tempfile.mkdtemp(prefix="omacounter-live-")
+        self.addCleanup(shutil.rmtree, tmp)
+        saved = cli.STATE_PATH, cli.SECRETS_PATH
+        cli.STATE_PATH, cli.SECRETS_PATH = os.path.join(tmp, "state.json"), os.path.join(tmp, "secrets.json")
+        self.addCleanup(lambda: setattr(cli, "STATE_PATH", saved[0]) or setattr(cli, "SECRETS_PATH", saved[1]))
+        counters = [{"type": "youtube.subscribers", "target": "@youtube", "label": "YT"}]
+        rows = cli.fetch_all(counters, max_age_minutes=15, force=True)["counters"]
+        self.assertIsNone(rows[0]["error"])
+        self.assertGreater(rows[0]["value"], 1_000_000)
+        self.assertEqual(rows[0]["tooltip"].split("\n")[0], "YT")
+        self.assertNotIn(os.environ["YOUTUBE_API_KEY"], json.dumps(rows))
+        # A second run inside the rate cap is served from the cache.
+        again = cli.fetch_all(counters, max_age_minutes=15, force=True)["counters"]
+        self.assertTrue(again[0]["rateLimited"])
+        self.assertEqual(again[0]["value"], rows[0]["value"])
 
 
 @unittest.skipUnless(os.environ.get("OMACOUNTER_LIVE"), "OMACOUNTER_LIVE not set")
@@ -895,15 +1012,59 @@ class LiveKeyless(unittest.TestCase):
         self.assertGreater(result.value, 1000)
         self.assertEqual(result.name, "octocat/Hello-World")
 
+    def test_github_issues_and_pulls(self):
+        issues = cli.PROVIDERS["github.issues"].fetch("octocat/Hello-World", {})
+        pulls = cli.PROVIDERS["github.pulls"].fetch("octocat/Hello-World", {})
+        self.assertGreaterEqual(issues.value, 0)
+        self.assertGreaterEqual(pulls.value, 0)
+        self.assertEqual(issues.url, "https://github.com/octocat/Hello-World/issues")
+
+    def test_github_missing_repo(self):
+        with self.assertRaises(cli.CounterError) as caught:
+            cli.PROVIDERS["github.stars"].fetch("octocat/no-such-repo-987654", {})
+        self.assertIn("not found", str(caught.exception))
+
     def test_mastodon(self):
         result = cli.PROVIDERS["mastodon.followers"].fetch("Gargron@mastodon.social", {})
         self.assertGreater(result.value, 100_000)
         self.assertTrue(result.name)
+        posts = cli.PROVIDERS["mastodon.posts"].fetch("Gargron@mastodon.social", {})
+        self.assertGreater(posts.value, 1000)
+
+    def test_mastodon_missing_account(self):
+        with self.assertRaises(cli.CounterError) as caught:
+            cli.PROVIDERS["mastodon.followers"].fetch("nosuchaccountxyz987654@mastodon.social", {})
+        self.assertIn("no account", str(caught.exception))
 
     def test_mastodon_tag(self):
         result = cli.PROVIDERS["mastodon.tag"].fetch("#TuneTuesday@mastodon.social", {})
         self.assertGreaterEqual(result.value, 0)
         self.assertEqual(result.name.lower(), "#tunetuesday")
+        people = cli.PROVIDERS["mastodon.tagpeople"].fetch("#TuneTuesday@mastodon.social", {})
+        self.assertGreaterEqual(people.value, 0)
+
+    def test_end_to_end_report(self):
+        # The CLI's fetch loop over three sources at once, from an empty
+        # cache: every row lands with a value, a name and a tooltip, and a
+        # bad target lands as a row error without taking the others down.
+        tmp = tempfile.mkdtemp(prefix="omacounter-live-")
+        self.addCleanup(shutil.rmtree, tmp)
+        saved = cli.STATE_PATH, cli.SECRETS_PATH
+        cli.STATE_PATH, cli.SECRETS_PATH = os.path.join(tmp, "state.json"), os.path.join(tmp, "secrets.json")
+        self.addCleanup(lambda: setattr(cli, "STATE_PATH", saved[0]) or setattr(cli, "SECRETS_PATH", saved[1]))
+        counters = [
+            {"type": "github.stars", "target": "octocat/Hello-World"},
+            {"type": "mastodon.followers", "target": "Gargron@mastodon.social"},
+            {"type": "github.stars", "target": "octocat/no-such-repo-987654"},
+        ]
+        rows = cli.fetch_all(counters, max_age_minutes=15, force=True)["counters"]
+        self.assertEqual([r["error"] for r in rows[:2]], [None, None])
+        self.assertTrue(all(r["value"] > 0 and r["name"] and r["tooltip"] for r in rows[:2]))
+        self.assertEqual(rows[2]["value"], None)
+        self.assertIn("not found", rows[2]["error"])
+        # Nothing resolved a name, so the row is labelled by its type.
+        self.assertEqual(rows[2]["tooltip"], "GitHub stars\nnot found")
+        self.assertTrue(rows[2]["nextFetchAt"])
 
 
 if __name__ == "__main__":

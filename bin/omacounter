@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """omacounter — the numbers behind the Counters widget in the Omarchy bar.
 
 The widget (BarWidget.qml + Panel.qml) never talks to a service itself. It
@@ -59,7 +59,8 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 import providers  # noqa: E402
-from providers.base import VERSION, CounterError, HttpError, Result, default_tooltip, grouped  # noqa: E402,F401
+from providers import base  # noqa: E402
+from providers.base import VERSION, CounterError, HttpError, Result, default_tooltip, grouped, minimal_env, scrub, trusted_tool  # noqa: E402,F401
 
 PROVIDERS = providers.load()
 CREDENTIALS = providers.credentials_of(PROVIDERS)
@@ -109,9 +110,16 @@ def accepted_sentence():
 # -------------------------------------------------------------- files & state
 
 
-def read_json(path, fallback):
+def read_json(path, fallback, nofollow=False):
+    """Parse a JSON file, or `fallback` when it is missing or malformed. With
+    `nofollow`, a symlink at `path` is not followed: the secrets and the
+    cache are this plugin's own files and are never read through a link."""
     try:
-        with open(path) as handle:
+        if nofollow:
+            handle = os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC))
+        else:
+            handle = open(path)
+        with handle:
             data = json.load(handle)
     except (OSError, ValueError):
         return fallback
@@ -135,7 +143,7 @@ def write_json(path, data, mode=0o600):
 
 
 def load_secrets():
-    return read_json(SECRETS_PATH, {})
+    return read_json(SECRETS_PATH, {}, nofollow=True)
 
 
 def save_secrets(secrets):
@@ -143,7 +151,7 @@ def save_secrets(secrets):
 
 
 def load_state():
-    state = read_json(STATE_PATH, {})
+    state = read_json(STATE_PATH, {}, nofollow=True)
     if not isinstance(state.get("counters"), dict):
         state["counters"] = {}
     return state
@@ -208,12 +216,26 @@ def widget_refresh_minutes():
     return max(1, minutes)
 
 
-def have(tool):
-    return shutil.which(tool) is not None
+# Helpers are run by absolute path from the system directories, and only
+# when root owns them (providers/base.py trusted_tool); Omarchy's own
+# commands come from its install directory under the same rule. A copy
+# earlier on the session's PATH is a program the user did not choose.
+OMARCHY_TOOLS = ("omarchy", "omarchy-shell")
+
+
+def tool(name):
+    return trusted_tool(name, omarchy=name in OMARCHY_TOOLS)
+
+
+def have(name):
+    return tool(name) is not None
 
 
 def run(argv, timeout=20, **kwargs):
-    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, **kwargs)
+    path = tool(argv[0])
+    if path is None:
+        raise CounterError("%s is not installed in the system directories" % argv[0])
+    return subprocess.run([path] + list(argv[1:]), capture_output=True, text=True, timeout=timeout, **kwargs)
 
 
 def plugin_enabled():
@@ -405,14 +427,23 @@ def fetch_all(counters, max_age_minutes=DEFAULT_INTERVAL_MINUTES, force=False, n
         elif cached.get("fetchedAtEpoch") is not None:
             row["nextFetchAt"] = iso_at(last_ok + interval * 60)
 
+    # Whatever a service says back is scrubbed of every credential we hold
+    # before it can reach the report, the panel or a log.
+    held = []
+    for cred in CREDENTIALS.values():
+        try:
+            held.append(cred.resolve(secrets))
+        except CounterError:
+            pass
+
     def work(job):
         provider, row = job
         try:
             return row, provider.fetch(row["target"], secrets), None
         except CounterError as error:
-            return row, None, str(error)
+            return row, None, scrub(str(error), held)
         except Exception as error:  # a provider bug must not take the others down
-            return row, None, "%s: %s" % (type(error).__name__, error)
+            return row, None, scrub("%s: %s" % (type(error).__name__, error), held)
 
     if jobs:
         with ThreadPoolExecutor(max_workers=min(4, len(jobs))) as pool:
@@ -481,14 +512,14 @@ def use_gum():
 def heading(text):
     if use_gum():
         print()
-        subprocess.run(["gum", "style", "--bold", "--foreground", "4", text])
+        subprocess.run([tool("gum"), "style", "--bold", "--foreground", "4", text])
     else:
         print("\n== " + text)
 
 
 def note(text):
     if use_gum():
-        subprocess.run(["gum", "style", "--faint", "--width", "76", text])
+        subprocess.run([tool("gum"), "style", "--faint", "--width", "76", text])
     else:
         print(textwrap.fill(text, 72, initial_indent="   ", subsequent_indent="   "))
 
@@ -505,7 +536,7 @@ def gum_output(argv):
 
 def ask(prompt, placeholder="", password=False):
     if use_gum():
-        argv = ["gum", "input", "--prompt", prompt + " ", "--placeholder", placeholder, "--width", "80"]
+        argv = [tool("gum"), "input", "--prompt", prompt + " ", "--placeholder", placeholder, "--width", "80"]
         if password:
             argv.append("--password")
         value = gum_output(argv)
@@ -531,7 +562,7 @@ def flush_tty_input():
 def confirm(prompt, default=True):
     flush_tty_input()
     if use_gum():
-        argv = ["gum", "confirm", prompt]
+        argv = [tool("gum"), "confirm", prompt]
         if not default:
             argv.append("--default=false")
         return subprocess.run(argv).returncode == 0
@@ -547,7 +578,7 @@ def choose(header, options):
     labels = [label for _, label in options]
     flush_tty_input()
     if use_gum():
-        picked = gum_output(["gum", "choose", "--header=" + header] + labels).strip()
+        picked = gum_output([tool("gum"), "choose", "--header=" + header] + labels).strip()
         for value, label in options:
             if label == picked:
                 print("%s %s" % (header, label))
@@ -604,7 +635,7 @@ def try_verify(cred, value):
         return True
     except CounterError as error:
         print("no.")
-        note(str(error))
+        note(scrub(str(error), [value]))
         hint = cred.hint_for(error)
         if hint:
             note(hint)
@@ -627,7 +658,7 @@ def setup_credential(cred, secrets):
     if cred.console_url:
         print("  " + cred.console_url)
         if have("xdg-open") and confirm("Open that page in your browser?"):
-            subprocess.Popen(["xdg-open", cred.console_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen([tool("xdg-open"), cred.console_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for attempt in range(3):
         flush_tty_input()
         value = ask("Paste the %s:" % cred.label, cred.placeholder, password=True).strip()
@@ -790,11 +821,15 @@ def ensure_on_bar(interactive_flow):
     enabled = plugin_enabled()
     if enabled is None:
         raise CounterError("the widget is not on the bar and `omarchy` is not available to enable it")
+    # Enabling puts an entry on the bar layout in shell.json: asked first,
+    # whichever command got here, and refused where nobody can answer.
+    if not interactive():
+        raise CounterError("the widget is not on the bar — run: omacounter setup, or: omarchy plugin enable " + PLUGIN_ID)
     if interactive_flow:
         heading("Enable the widget")
         note("It is installed but not on the bar yet.")
-        if not confirm("Put the Counters widget on the bar now?"):
-            raise CounterError("not enabled; nothing was changed")
+    if not confirm("Put the Counters widget on the bar now?"):
+        raise CounterError("not enabled; nothing was changed")
     enable_plugin()
     print("Enabled " + PLUGIN_ID)
 
@@ -1144,7 +1179,7 @@ def cmd_open(args):
     provider, row = resolve_counter(0, counters[index])
     if provider is None or not row["url"]:
         fail("nothing to open for that counter")
-    subprocess.Popen(["xdg-open", row["url"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.Popen([tool("xdg-open"), row["url"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def cmd_auth(args):
@@ -1181,21 +1216,30 @@ def cmd_auth(args):
             fail(str(error))
         print("The %s works" % cred.label)
     else:  # set
-        value = (args.value or "").strip()
-        if not value:
+        # The value is prompted for or read from stdin, never taken from
+        # the command line: argv is visible to every process and lands in
+        # the shell's history.
+        if getattr(args, "stdin", False):
+            value = sys.stdin.readline().strip()
+        elif interactive():
             try:
                 flush_tty_input()
                 value = ask("Paste the %s:" % cred.label, cred.placeholder, password=True).strip()
             except (KeyboardInterrupt, EOFError):
                 fail("cancelled")
+        else:
+            fail("no terminal to ask on — pipe the %s in: omacounter auth %s set --stdin" % (cred.label, cred.id), 64)
+        if not value:
+            fail("nothing to save")
         if not cred.shape.match(value):
             fail("that does not look like a %s (%s)" % (cred.label, cred.shape_help))
         try:
             cred.verify(value)
         except CounterError as error:
+            message = scrub(str(error), [value])
             hint = cred.hint_for(error)
-            if not interactive() or not confirm("Not accepted (%s). Save it anyway?" % (str(error) + ((" " + hint) if hint else "")), False):
-                fail(str(error))
+            if not interactive() or not confirm("Not accepted (%s). Save it anyway?" % (message + ((" " + hint) if hint else "")), False):
+                fail(message)
         cred.store(secrets, value)
         save_secrets(secrets)
         notify_widget()
@@ -1345,6 +1389,18 @@ def cmd_doctor(args):
     else:
         print("  unknown  could not list plugins")
     print()
+    print("Helpers (from %s, or Omarchy's %s):" % (", ".join(base.TRUSTED_DIRS), base.OMARCHY_BIN))
+    for name, why in (("gum", "the wizard's prompts (plain input without it)"), ("xdg-open", "opening a counter's page"),
+                      ("gh", "a GitHub token from its login (or store one: omacounter auth github set)")):
+        path = tool(name)
+        elsewhere = shutil.which(name)
+        if path:
+            print("  ok       %s  %s" % (path, why))
+        elif elsewhere:
+            print("  skipped  %s is at %s, outside the system directories, so it is not used — %s" % (name, elsewhere, why))
+        else:
+            print("  absent   %s — %s" % (name, why))
+    print()
     print("Providers (%s):" % providers.PROVIDERS_DIR)
     print("  ok       %d types: %s" % (len(PROVIDERS), ", ".join(PROVIDERS)))
     for name, error in providers.LOAD_ERRORS:
@@ -1472,12 +1528,12 @@ def build_parser():
     auth = sub.add_parser("auth", help="manage stored keys and tokens: `auth` lists them, `auth <id> set|show|check|clear`")
     auth.add_argument("cred", nargs="?", help="credential id from `auth` or `types`, e.g. youtube")
     auth.add_argument("action", nargs="?", choices=["show", "set", "check", "clear"])
-    auth.add_argument("value", nargs="?", help="the key or token, for `set` (prompted when omitted)")
+    auth.add_argument("--stdin", action="store_true", help="for `set`: read the key or token from stdin instead of prompting")
     auth.set_defaults(func=cmd_auth)
 
     key = sub.add_parser("key", help="alias for `auth youtube …`")
     key.add_argument("action", nargs="?", default="show", choices=["show", "set", "check", "clear"])
-    key.add_argument("value", nargs="?", help="the key, for `set` (prompted when omitted)")
+    key.add_argument("--stdin", action="store_true", help="for `set`: read the key from stdin instead of prompting")
     key.set_defaults(func=cmd_auth, cred="youtube")
 
     doctor = sub.add_parser("doctor", help="check the install, the providers, the credentials and every counter")
