@@ -19,6 +19,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import urllib.request
 from contextlib import redirect_stdout
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -851,7 +852,18 @@ class Credentials(Sandbox):
         youtube.YouTubeKey.verify = lambda self, value: None
         self.write_shell([{"type": "youtube.likes", "target": "dQw4w9WgXcQ"}])
         os.environ.pop("YOUTUBE_API_KEY", None)
-        code, out = self.run_cli(["auth", "youtube", "set", "k" * 30])
+        # The key is never taken from the command line: piped in instead.
+        with self.assertRaises(SystemExit):
+            self.run_cli(["auth", "youtube", "set", "k" * 30])
+        with self.assertRaises(SystemExit) as caught:
+            self.run_cli(["auth", "youtube", "set"])   # no terminal in a test, no --stdin
+        self.assertEqual(caught.exception.code, 64)
+        saved_stdin = sys.stdin
+        sys.stdin = io.StringIO("k" * 30 + "\n")
+        try:
+            code, out = self.run_cli(["auth", "youtube", "set", "--stdin"])
+        finally:
+            sys.stdin = saved_stdin
         self.assertEqual(code, 0)
         self.assertEqual(cli.load_secrets(), {"youtube": {"apiKey": "k" * 30}})
         code, out = self.run_cli(["auth", "youtube", "show"])
@@ -866,6 +878,76 @@ class Credentials(Sandbox):
         with self.assertRaises(SystemExit) as caught:
             self.run_cli(["auth", "nope", "show"])
         self.assertEqual(caught.exception.code, 64)
+
+
+# ------------------------------------------------------------------ hardening
+
+
+class Hardening(Sandbox):
+    def test_trusted_tool_ignores_the_users_path(self):
+        # A helper is found only in the system directories, root-owned.
+        sh = base.trusted_tool("sh")
+        self.assertIn(sh, ("/usr/local/bin/sh", "/usr/bin/sh", "/bin/sh"))
+        self.assertTrue(base.trusted_file(sh))
+        planted = os.path.join(self.tmp, "gh")
+        with open(planted, "w") as fh:
+            fh.write("#!/bin/sh\necho stolen\n")
+        os.chmod(planted, 0o755)
+        saved = os.environ.get("PATH", "")
+        os.environ["PATH"] = self.tmp + ":" + saved
+        self.addCleanup(os.environ.__setitem__, "PATH", saved)
+        self.assertEqual(shutil.which("gh"), planted)
+        base._TOOL_CACHE.clear()
+        self.assertNotEqual(base.trusted_tool("gh"), planted)
+        self.assertIsNone(base.trusted_tool("no-such-helper-xyz"))
+        self.assertFalse(base.trusted_file(planted))
+
+    def test_minimal_env(self):
+        os.environ["LD_PRELOAD"] = "/tmp/evil.so"
+        os.environ["HOME"] = "/home/someone"
+        self.addCleanup(os.environ.pop, "LD_PRELOAD", None)
+        env = base.minimal_env(("GH_CONFIG_DIR",))
+        self.assertEqual(env["PATH"], "/usr/local/bin:/usr/bin:/bin")
+        self.assertEqual(env["HOME"], "/home/someone")
+        self.assertNotIn("LD_PRELOAD", env)
+        self.assertNotIn("SSL_CERT_FILE", env)
+
+    def test_only_https_and_https_redirects(self):
+        with self.assertRaises(cli.CounterError):
+            base.http_json("http://api.github.com/repos/o/r")
+        handler = base.HttpsOnlyRedirects()
+        req = urllib.request.Request("https://example.test/a")
+        with self.assertRaises(cli.CounterError):
+            handler.redirect_request(req, None, 302, "Found", {}, "http://example.test/b")
+        moved = handler.redirect_request(req, None, 302, "Found", {}, "https://example.test/b")
+        self.assertEqual(moved.full_url, "https://example.test/b")
+        self.assertEqual(base.MAX_REDIRECTS, 3)
+
+    def test_errors_are_scrubbed_of_credentials(self):
+        self.assertEqual(base.scrub("key AIzaSyEXAMPLEKEY0123 rejected", ["AIzaSyEXAMPLEKEY0123"]), "key ••• rejected")
+        self.assertEqual(base.scrub("short", ["ab"]), "short")   # a tiny value would blank real words
+        os.environ["YOUTUBE_API_KEY"] = "secret-key-0123456789"
+        self.addCleanup(os.environ.pop, "YOUTUBE_API_KEY", None)
+        self.fake("youtube.likes", lambda t, s: (_ for _ in ()).throw(cli.CounterError("bad request for key=secret-key-0123456789")))
+        row = cli.fetch_all([{"type": "youtube.likes", "target": "dQw4w9WgXcQ"}], now=0)["counters"][0]
+        self.assertEqual(row["error"], "bad request for key=•••")
+        self.assertNotIn("secret-key", row["tooltip"])
+
+    def test_secrets_and_state_are_not_read_through_a_symlink(self):
+        elsewhere = os.path.join(self.tmp, "elsewhere.json")
+        with open(elsewhere, "w") as fh:
+            json.dump({"youtube": {"apiKey": "k" * 30}}, fh)
+        os.makedirs(os.path.dirname(cli.SECRETS_PATH), exist_ok=True)
+        os.symlink(elsewhere, cli.SECRETS_PATH)
+        self.assertEqual(cli.load_secrets(), {})
+        os.unlink(cli.SECRETS_PATH)
+        cli.save_secrets({"youtube": {"apiKey": "k" * 30}})
+        self.assertEqual(cli.load_secrets(), {"youtube": {"apiKey": "k" * 30}})
+
+    def test_add_does_not_enable_the_widget_unasked(self):
+        self.write_shell(present=False)
+        with self.assertRaises(SystemExit):
+            self.run_cli(["add", "github.stars", "octocat/Hello-World", "--no-verify"])
 
 
 # ----------------------------------------------------------------------- live

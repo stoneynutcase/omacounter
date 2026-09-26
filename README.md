@@ -23,8 +23,8 @@ zero.
   key. Setup walks you through it; it takes about two minutes and only reads
   public statistics. Mastodon counters and GitHub stars, issues and pull
   requests need nothing. GitHub unique cloners need a token that can read
-  the repository; a logged-in `gh` CLI counts, so on most developer machines
-  nothing has to be stored.
+  the repository; a logged-in `gh` CLI counts when it is the system package
+  (`/usr/bin/gh`), so on most developer machines nothing has to be stored.
 
 ## Install
 
@@ -218,6 +218,7 @@ omacounter fill                    write each counter's default glyph and colour
 omacounter open <n|target>         open a counter's page
 omacounter auth                    the stored keys and tokens, and who uses them
 omacounter auth <id> set|show|check|clear
+                                        `set` prompts for the value, or reads it with --stdin; never from the command line
 omacounter key …                   alias for `auth youtube …`
 omacounter doctor [--online]       what is wrong, if anything
 omacounter types                   the counter types: target, what they need, rate cap
@@ -227,7 +228,9 @@ omacounter install                 link omacounter into ~/.local/bin
 Keys and tokens live in `~/.config/omacounter/secrets.json` (mode 600),
 one entry per credential, never in `shell.json`, so a dotfiles repo cannot
 leak them. `YOUTUBE_API_KEY` and `GITHUB_TOKEN` in the environment work too,
-and for GitHub a logged-in `gh` CLI is used when nothing else is set.
+and for GitHub the system's `gh` CLI is asked for its login when nothing
+else is set (`gh auth token | omacounter auth github set --stdin` stores it
+when `gh` is installed elsewhere).
 
 ## More sources
 
@@ -238,6 +241,57 @@ tooltip says. Drop a file in and it is discovered. [DEVELOPING.md](DEVELOPING.md
 shows how; Bluesky followers and GitHub followers are the obvious next ones.
 X is possible but needs a developer account, four secrets and a paid tier for
 anyone's followers but your own, which is why it is not here.
+
+## What it touches
+
+A widget that holds an API key and talks to the internet every few minutes
+should say exactly how far it reaches. In full:
+
+- **Network** — only the services behind the counters you configured:
+  `www.googleapis.com` for YouTube, `api.github.com` for GitHub, and for
+  Mastodon the instance named in the counter. Every request is https to a
+  fixed address built by the source's own file; a redirect is followed only
+  to another https address, three hops at most; answers are capped at one
+  megabyte and ten seconds. No analytics, no telemetry, no other host.
+- **Your keys** — written to `~/.config/omacounter/secrets.json`, mode 600,
+  read from there or from the environment, and never taken from a command
+  line: `auth … set` prompts or reads stdin. YouTube authenticates with a
+  query parameter, so the key travels in the request URL; the request is
+  made in-process, so it never appears in `ps` or `/proc`, and every
+  credential is scrubbed from whatever a service says back before it can
+  reach the panel, the report or a log. GitHub's token goes in a header.
+- **The programs it runs** — `python3` for the CLI, `gh` for a token,
+  `gum` for the wizard's prompts, `xdg-open` for a counter's page, and
+  Omarchy's own commands: each by absolute path out of `/usr/local/bin`,
+  `/usr/bin`, `/bin` or Omarchy's install directory, and only when root owns
+  it and nobody else can write it. `PATH` is replaced rather than consulted.
+  The panel starts the CLI with the shell's environment cleared and only the
+  locale, your home and XDG directories, proxy settings and the credential
+  variables handed over. `omacounter doctor` says so if a helper is installed
+  somewhere it will not run from.
+- **Installing** — Omacounter installs no packages and asks for no
+  privileges. It writes outside its own directory only with your say-so:
+  putting the widget on the bar (`setup` and `add` ask first), the
+  `~/.local/bin/omacounter` link (`install`, which will not replace a file it
+  did not put there unless you pass `--force`), and the counters and settings
+  on its own entry in `~/.config/omarchy/shell.json`, which the panel and the
+  command line edit through the shell's own settings path.
+- **Your files** — reads and writes `~/.config/omacounter/secrets.json`,
+  `~/.local/state/omacounter/state.json` (the cache and daily history), and
+  its entry in `shell.json`. Each write lands in a randomly named file in the
+  same directory and is renamed into place, and the secrets and the cache
+  are never read through a symlink.
+
+## Removing it
+
+```bash
+omarchy plugin remove stoneynutcase.omacounter --yes
+rm -rf ~/.config/omacounter ~/.local/state/omacounter   # your keys and the cache
+rm -f ~/.local/bin/omacounter                            # if you ran `install`
+```
+
+Removing the plugin takes its entry, counters included, off the bar layout
+in `shell.json`. Nothing else was written anywhere.
 
 ## License
 
