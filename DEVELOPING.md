@@ -348,7 +348,19 @@ Shell log: `journalctl --user -o cat _COMM=quickshell`.
 ```bash
 python3 -m unittest discover -s test -v     # the CLI and providers, offline
 node --test "test/*.test.mjs"                            # Model.js
+
+# Live, against the real services (what .github/workflows/integration.yml runs
+# daily and on every change to providers/, bin/ or test/):
+OMACOUNTER_LIVE=1 python3 -m unittest discover -s test -p test_cli.py -k LiveKeyless -v
+YOUTUBE_API_KEY=… python3 -m unittest discover -s test -p test_cli.py -k LiveYouTube -v
 ```
+
+The keyed job takes the key from the repository secret `YOUTUBE_API_KEY`;
+a pull request from a fork gets no secret and the YouTube tests skip rather
+than fail. The keyless job runs with the workflow's own `GITHUB_TOKEN` so
+GitHub's unauthenticated limit does not bite on a shared runner address. A
+failing scheduled run opens (or comments on) an issue titled "Daily
+integration run is failing".
 
 Nothing to install. The Python tests load `bin/omacounter` as a module,
 which puts the plugin root on `sys.path` so `providers` is the same package

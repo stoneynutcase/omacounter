@@ -964,10 +964,45 @@ class LiveYouTube(unittest.TestCase):
         result = cli.PROVIDERS["youtube.likes"].fetch("dQw4w9WgXcQ", {})
         self.assertGreater(result.value, 1_000_000)
 
+    def test_views(self):
+        result = cli.PROVIDERS["youtube.views"].fetch("dQw4w9WgXcQ", {})
+        self.assertGreater(result.value, 1_000_000_000)
+        self.assertEqual(result.url, "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+
+    def test_key_is_accepted(self):
+        youtube.CREDENTIAL.verify(os.environ["YOUTUBE_API_KEY"])
+
     def test_rejected_key_is_reported(self):
         with self.assertRaises(cli.CounterError) as caught:
             youtube.CREDENTIAL.verify("AIzaNotARealKey0000000000000000000000")
         self.assertIn("rejected", str(caught.exception))
+
+    def test_missing_channel_and_video(self):
+        with self.assertRaises(cli.CounterError) as caught:
+            cli.PROVIDERS["youtube.subscribers"].fetch("@no-such-channel-xyz-987654", {})
+        self.assertIn("not found", str(caught.exception))
+        with self.assertRaises(cli.CounterError) as caught:
+            cli.PROVIDERS["youtube.likes"].fetch("zzzzzzzzzzz", {})
+        self.assertIn("not found", str(caught.exception))
+
+    def test_end_to_end_report(self):
+        # The fetch loop as the panel runs it: cache in a temp dir, one key
+        # from the environment, a report row per counter.
+        tmp = tempfile.mkdtemp(prefix="omacounter-live-")
+        self.addCleanup(shutil.rmtree, tmp)
+        saved = cli.STATE_PATH, cli.SECRETS_PATH
+        cli.STATE_PATH, cli.SECRETS_PATH = os.path.join(tmp, "state.json"), os.path.join(tmp, "secrets.json")
+        self.addCleanup(lambda: setattr(cli, "STATE_PATH", saved[0]) or setattr(cli, "SECRETS_PATH", saved[1]))
+        counters = [{"type": "youtube.subscribers", "target": "@youtube", "label": "YT"}]
+        rows = cli.fetch_all(counters, max_age_minutes=15, force=True)["counters"]
+        self.assertIsNone(rows[0]["error"])
+        self.assertGreater(rows[0]["value"], 1_000_000)
+        self.assertEqual(rows[0]["tooltip"].split("\n")[0], "YT")
+        self.assertNotIn(os.environ["YOUTUBE_API_KEY"], json.dumps(rows))
+        # A second run inside the rate cap is served from the cache.
+        again = cli.fetch_all(counters, max_age_minutes=15, force=True)["counters"]
+        self.assertTrue(again[0]["rateLimited"])
+        self.assertEqual(again[0]["value"], rows[0]["value"])
 
 
 @unittest.skipUnless(os.environ.get("OMACOUNTER_LIVE"), "OMACOUNTER_LIVE not set")
@@ -977,15 +1012,59 @@ class LiveKeyless(unittest.TestCase):
         self.assertGreater(result.value, 1000)
         self.assertEqual(result.name, "octocat/Hello-World")
 
+    def test_github_issues_and_pulls(self):
+        issues = cli.PROVIDERS["github.issues"].fetch("octocat/Hello-World", {})
+        pulls = cli.PROVIDERS["github.pulls"].fetch("octocat/Hello-World", {})
+        self.assertGreaterEqual(issues.value, 0)
+        self.assertGreaterEqual(pulls.value, 0)
+        self.assertEqual(issues.url, "https://github.com/octocat/Hello-World/issues")
+
+    def test_github_missing_repo(self):
+        with self.assertRaises(cli.CounterError) as caught:
+            cli.PROVIDERS["github.stars"].fetch("octocat/no-such-repo-987654", {})
+        self.assertIn("not found", str(caught.exception))
+
     def test_mastodon(self):
         result = cli.PROVIDERS["mastodon.followers"].fetch("Gargron@mastodon.social", {})
         self.assertGreater(result.value, 100_000)
         self.assertTrue(result.name)
+        posts = cli.PROVIDERS["mastodon.posts"].fetch("Gargron@mastodon.social", {})
+        self.assertGreater(posts.value, 1000)
+
+    def test_mastodon_missing_account(self):
+        with self.assertRaises(cli.CounterError) as caught:
+            cli.PROVIDERS["mastodon.followers"].fetch("nosuchaccountxyz987654@mastodon.social", {})
+        self.assertIn("no account", str(caught.exception))
 
     def test_mastodon_tag(self):
         result = cli.PROVIDERS["mastodon.tag"].fetch("#TuneTuesday@mastodon.social", {})
         self.assertGreaterEqual(result.value, 0)
         self.assertEqual(result.name.lower(), "#tunetuesday")
+        people = cli.PROVIDERS["mastodon.tagpeople"].fetch("#TuneTuesday@mastodon.social", {})
+        self.assertGreaterEqual(people.value, 0)
+
+    def test_end_to_end_report(self):
+        # The CLI's fetch loop over three sources at once, from an empty
+        # cache: every row lands with a value, a name and a tooltip, and a
+        # bad target lands as a row error without taking the others down.
+        tmp = tempfile.mkdtemp(prefix="omacounter-live-")
+        self.addCleanup(shutil.rmtree, tmp)
+        saved = cli.STATE_PATH, cli.SECRETS_PATH
+        cli.STATE_PATH, cli.SECRETS_PATH = os.path.join(tmp, "state.json"), os.path.join(tmp, "secrets.json")
+        self.addCleanup(lambda: setattr(cli, "STATE_PATH", saved[0]) or setattr(cli, "SECRETS_PATH", saved[1]))
+        counters = [
+            {"type": "github.stars", "target": "octocat/Hello-World"},
+            {"type": "mastodon.followers", "target": "Gargron@mastodon.social"},
+            {"type": "github.stars", "target": "octocat/no-such-repo-987654"},
+        ]
+        rows = cli.fetch_all(counters, max_age_minutes=15, force=True)["counters"]
+        self.assertEqual([r["error"] for r in rows[:2]], [None, None])
+        self.assertTrue(all(r["value"] > 0 and r["name"] and r["tooltip"] for r in rows[:2]))
+        self.assertEqual(rows[2]["value"], None)
+        self.assertIn("not found", rows[2]["error"])
+        # Nothing resolved a name, so the row is labelled by its type.
+        self.assertEqual(rows[2]["tooltip"], "GitHub stars\nnot found")
+        self.assertTrue(rows[2]["nextFetchAt"])
 
 
 if __name__ == "__main__":

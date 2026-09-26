@@ -188,6 +188,8 @@ def http_json(url, timeout=HTTP_TIMEOUT, headers=None):
             body = error.read(MAX_RESPONSE_BYTES)
         except OSError:
             pass
+        finally:
+            error.close()
         message, reason = "", ""
         try:
             parsed = json.loads(body)

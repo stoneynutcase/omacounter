@@ -1,0 +1,132 @@
+name: Integration
+
+# These tests talk to YouTube, GitHub and Mastodon for real, which is the
+# point of them: a source changes its answers on its own schedule, so a
+# daily run catches that before a user does.
+#
+# Actions are pinned to a commit SHA, with the version they were at in the
+# comment beside them. A tag like v7 is a moving pointer its owner can
+# repoint at any time, and the keyed job below runs with YOUTUBE_API_KEY in
+# its environment — that is not a job to hand to whatever a tag means today.
+#
+# Setup: add a YouTube Data API v3 key as the repository secret
+# YOUTUBE_API_KEY (Settings → Secrets and variables → Actions). Without it
+# the keyed job still runs and simply skips the tests that need a key, so
+# pull requests from forks — which never receive secrets — are not failed
+# for something the contributor cannot fix.
+
+on:
+  schedule:
+    # Daily, deliberately off the hour: GitHub delays scheduled jobs that
+    # all pile onto :00.
+    - cron: "41 6 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "providers/**"
+      - "bin/**"
+      - "test/**"
+      - "manifest.json"
+      - ".github/workflows/integration.yml"
+  pull_request:
+    paths:
+      - "providers/**"
+      - "bin/**"
+      - "test/**"
+      - "manifest.json"
+      - ".github/workflows/integration.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-${{ github.ref }}
+  # Superseding a pull request's run is fine; cancelling the daily canary
+  # because someone pushed is not.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  keyless:
+    name: GitHub and Mastodon
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Live fetches through the providers and the CLI
+        run: python3 -m unittest discover -s test -p test_cli.py -k LiveKeyless -v
+        env:
+          OMACOUNTER_LIVE: "1"
+          # The workflow's own token lifts GitHub's unauthenticated limit of
+          # 60 requests an hour, which a busy runner address can exhaust.
+          GITHUB_TOKEN: ${{ github.token }}
+
+  keyed:
+    name: YouTube (API)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Live fetches with the API key
+        run: python3 -m unittest discover -s test -p test_cli.py -k LiveYouTube -v
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+
+  report:
+    name: Report a broken daily run
+    needs: [keyless, keyed]
+    # Only for the unattended run. A failure on a push or a pull request is
+    # already in front of whoever caused it.
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const title = "Daily integration run is failing";
+            const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}` +
+                        `/actions/runs/${context.runId}`;
+            const body = [
+              `The scheduled integration run failed: ${run}`,
+              "",
+              "Where to look first:",
+              "",
+              "- **GitHub and Mastodon** fetch public numbers for octocat/Hello-World,",
+              "  Gargron@mastodon.social and #TuneTuesday@mastodon.social, and run the",
+              "  CLI's fetch loop end to end. A failure there means a response shape",
+              "  changed, or a rate limit hit (GitHub's search endpoint allows 30 a",
+              "  minute with a token).",
+              "- **YouTube (API)** calls the Data API with the `YOUTUBE_API_KEY` secret.",
+              "  If only that job failed, check the key is still valid and the day's",
+              "  10,000-unit quota is not used up before suspecting the code.",
+            ].join("\n");
+
+            const open = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "open",
+              per_page: 100,
+            });
+            const existing = open.find((i) => i.title === title && !i.pull_request);
+
+            if (existing) {
+              // One issue for the outage, a comment per day it persists.
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+              });
+            }
