@@ -1,0 +1,1510 @@
+#!/usr/bin/env python3
+"""omacounter — the numbers behind the Counters widget in the Omarchy bar.
+
+The widget (BarWidget.qml + Panel.qml) never talks to a service itself. It
+runs `omacounter fetch` and renders whatever JSON comes back. Every
+source is one file in providers/ filling the contract in providers/base.py;
+adding a source is adding a file — DEVELOPING.md walks through it.
+
+Counters are plain objects on the widget's entry in ~/.config/omarchy/shell.json:
+
+  { "id": "stoneynutcase.omacounter",
+    "counters": [
+      { "type": "youtube.subscribers", "target": "@omarchy" },
+      { "type": "youtube.likes", "target": "dQw4w9WgXcQ", "label": "Never gonna",
+        "style": "long", "glyphColor": "urgent", "textColor": "accent", "interval": 60 },
+      { "type": "github.stars", "target": "octocat/Hello-World" }
+    ] }
+
+Only `type` and `target` are required. Keys and tokens are the one thing that
+does not belong in shell.json (it tends to end up in dotfiles), so they live
+in ~/.config/omacounter/secrets.json, mode 600, one entry per credential.
+
+Commands (see --help): setup, add, set, remove, list, fetch, open, auth, doctor,
+install, types, refresh.
+"""
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+PLUGIN_ID = "stoneynutcase.omacounter"
+
+HOME = os.path.expanduser("~")
+CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
+STATE_HOME = os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state")
+SECRETS_PATH = os.path.join(CONFIG_HOME, "omacounter", "secrets.json")
+STATE_PATH = os.path.join(STATE_HOME, "omacounter", "state.json")
+SHELL_JSON = os.path.join(CONFIG_HOME, "omarchy", "shell.json")
+
+# Resolved through symlinks on purpose: `install` links this file into
+# ~/.local/bin, and the plugin root (with providers/) has to be found from
+# the real location.
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+ROOT_DIR = os.path.dirname(SCRIPT_DIR)
+
+# The providers package lives next to bin/. No bytecode: the installed
+# plugin is a git clone and the shell runs this every few minutes.
+sys.dont_write_bytecode = True
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
+import providers  # noqa: E402
+from providers.base import VERSION, CounterError, HttpError, Result, default_tooltip, grouped  # noqa: E402,F401
+
+PROVIDERS = providers.load()
+CREDENTIALS = providers.credentials_of(PROVIDERS)
+
+DEFAULT_INTERVAL_MINUTES = 15
+ERROR_RETRY_MINUTES = 2
+HISTORY_DAYS = 90
+
+
+def detect_providers(raw):
+    """Every provider whose target format `raw` matches, in registry order.
+    One match means the type is implied by the link; several (a video can be
+    counted by likes or by views) means the wizard asks which."""
+    matches = []
+    for provider in PROVIDERS.values():
+        try:
+            provider.normalize(raw)
+            matches.append(provider)
+        except ValueError:
+            continue
+    return matches
+
+
+def detect_provider(raw):
+    matches = detect_providers(raw)
+    return matches[0] if matches else None
+
+
+def accepted_targets():
+    """The unique `accepts` phrases, in registry order, for prompts."""
+    seen = []
+    for provider in PROVIDERS.values():
+        if provider.accepts and provider.accepts not in seen:
+            seen.append(provider.accepts)
+    return seen
+
+
+def accepted_sentence():
+    phrases = accepted_targets()
+    if not phrases:
+        return "a link"
+    if len(phrases) == 1:
+        return phrases[0]
+    return ", ".join(phrases[:-1]) + " or " + phrases[-1]
+
+
+# -------------------------------------------------------------- files & state
+
+
+def read_json(path, fallback):
+    try:
+        with open(path) as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return fallback
+    return data if isinstance(data, type(fallback)) else fallback
+
+
+def write_json(path, data, mode=0o600):
+    """Atomic replace through a private temp file in the same directory."""
+    directory = os.path.dirname(path)
+    os.makedirs(directory, 0o700, exist_ok=True)
+    handle, tmp = tempfile.mkstemp(prefix=".tmp-", dir=directory)
+    try:
+        with os.fdopen(handle, "w") as out:
+            json.dump(data, out, indent=2, ensure_ascii=False)
+            out.write("\n")
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
+def load_secrets():
+    return read_json(SECRETS_PATH, {})
+
+
+def save_secrets(secrets):
+    write_json(SECRETS_PATH, secrets, 0o600)
+
+
+def load_state():
+    state = read_json(STATE_PATH, {})
+    if not isinstance(state.get("counters"), dict):
+        state["counters"] = {}
+    return state
+
+
+def save_state(state):
+    write_json(STATE_PATH, state, 0o600)
+
+
+def counter_key(counter):
+    return "%s:%s" % (counter.get("type", ""), counter.get("target", ""))
+
+
+# ----------------------------------------------------------------- shell.json
+
+
+def shell_config_path():
+    if os.path.exists(SHELL_JSON):
+        return SHELL_JSON
+    omarchy_path = os.environ.get("OMARCHY_PATH", "/usr/share/omarchy")
+    return os.path.join(omarchy_path, "config", "omarchy", "shell.json")
+
+
+def load_shell_config():
+    return read_json(shell_config_path(), {})
+
+
+def find_entry(config):
+    """The widget's entry in the bar layout (or plugins[]), or None."""
+    bar = config.get("bar") if isinstance(config.get("bar"), dict) else {}
+    layout = bar.get("layout") if isinstance(bar.get("layout"), dict) else {}
+    for section in ("left", "center", "right"):
+        for entry in layout.get(section) or []:
+            if isinstance(entry, dict) and entry.get("id") == PLUGIN_ID:
+                return entry
+    for entry in config.get("plugins") or []:
+        if isinstance(entry, dict) and entry.get("id") == PLUGIN_ID:
+            return entry
+    return None
+
+
+def read_counters():
+    """Counters on the entry in panel order (see `in_panel_order`), or None
+    when the widget is not on the bar. The numbers `list` prints, and that
+    `set`/`move`/`remove` take, are positions in this order, and a write
+    stores it, so the file ends up in the order the panel shows."""
+    entry = find_entry(load_shell_config())
+    if entry is None:
+        return None
+    counters = entry.get("counters")
+    return in_panel_order([c for c in counters if isinstance(c, dict)]) if isinstance(counters, list) else []
+
+
+def widget_refresh_minutes():
+    """The widget's own refreshMinutes setting, as the panel passes it to
+    fetch; the plugin default when unset or when the widget is not on the bar."""
+    entry = find_entry(load_shell_config()) or {}
+    try:
+        minutes = int(entry.get("refreshMinutes"))
+    except (TypeError, ValueError):
+        return DEFAULT_INTERVAL_MINUTES
+    return max(1, minutes)
+
+
+def have(tool):
+    return shutil.which(tool) is not None
+
+
+def run(argv, timeout=20, **kwargs):
+    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, **kwargs)
+
+
+def plugin_enabled():
+    if not have("omarchy"):
+        return None
+    try:
+        result = run(["omarchy", "plugin", "list", "--json"])
+        plugins = json.loads(result.stdout)
+    except (subprocess.SubprocessError, ValueError, OSError):
+        return None
+    for plugin in plugins:
+        if isinstance(plugin, dict) and plugin.get("id") == PLUGIN_ID:
+            return bool(plugin.get("enabled"))
+    return None
+
+
+def enable_plugin():
+    result = run(["omarchy", "plugin", "enable", PLUGIN_ID], timeout=30)
+    if result.returncode != 0:
+        raise CounterError("could not enable the plugin: " + (result.stderr.strip() or result.stdout.strip()))
+
+
+def write_counters(counters):
+    """Persist the list onto the widget's entry in shell.json.
+
+    Written to the file directly, atomically: the shell watches shell.json and
+    reloads it on save, so the bar updates at once. (`omarchy bar set … --json`
+    would be the polite route, but the shell's IPC layer splits a bracketed
+    argument on its commas, so it cannot carry an array.)
+    """
+    config = load_shell_config()
+    entry = find_entry(config)
+    if entry is None:
+        raise CounterError("the widget is not on the bar — run: omarchy plugin enable " + PLUGIN_ID)
+    entry["counters"] = counters
+    write_json(SHELL_JSON, config, 0o644)
+
+
+def notify_widget():
+    """Ask the live widget to refetch. Best effort: no shell, no problem."""
+    if have("omarchy-shell"):
+        try:
+            run(["omarchy-shell", "-q", PLUGIN_ID, "refresh"], timeout=5)
+        except (subprocess.SubprocessError, OSError):
+            pass
+
+
+# ---------------------------------------------------------------------- fetch
+
+
+def local_today():
+    return dt.date.today()
+
+
+def history_deltas(history, value, today):
+    """Change since the last value seen before today, and since a week ago."""
+    dates = sorted(d for d in history if isinstance(history[d], int))
+    day_delta = week_delta = None
+    before_today = [d for d in dates if d < today.isoformat()]
+    if before_today:
+        day_delta = value - history[before_today[-1]]
+    week_ago = (today - dt.timedelta(days=7)).isoformat()
+    on_or_before_week = [d for d in dates if d <= week_ago]
+    if on_or_before_week:
+        week_delta = value - history[on_or_before_week[-1]]
+    return day_delta, week_delta
+
+
+def prune_history(history, today):
+    cutoff = (today - dt.timedelta(days=HISTORY_DAYS)).isoformat()
+    return {d: v for d, v in history.items() if d >= cutoff and isinstance(v, int)}
+
+
+def iso_at(epoch):
+    return dt.datetime.fromtimestamp(epoch).isoformat(timespec="seconds")
+
+
+def effective_interval(provider, counter_interval, max_age_minutes):
+    """Minutes between fetches: the counter's own, else the provider's
+    default, else the widget's, never below the provider's rate cap."""
+    minutes = None
+    try:
+        if counter_interval not in (None, ""):
+            minutes = float(counter_interval)
+    except (TypeError, ValueError):
+        minutes = None
+    if minutes is None and provider.default_interval:
+        minutes = float(provider.default_interval)
+    if minutes is None:
+        minutes = float(max_age_minutes)
+    return max(1.0, float(provider.min_interval or 1), minutes)
+
+
+def resolve_counter(index, counter):
+    """Validate one configured counter into the shape the rest of fetch uses."""
+    provider = PROVIDERS.get(str(counter.get("type", "")))
+    row = {
+        "index": index,
+        "type": str(counter.get("type", "")),
+        "target": str(counter.get("target", "")),
+        "label": str(counter.get("label", "") or ""),
+        "icon": str(counter.get("icon", "") or (provider.icon if provider else "\U000F0199")),
+        "brandColor": provider.brand_color if provider else "",
+        "brandTextColor": provider.text_color if provider else "",
+        "unit": provider.unit if provider else "",
+        "group": provider.group_key if provider else "",
+        "groupLabel": provider.group_name if provider else "",
+        "credential": provider.credential.id if provider and provider.credential else "",
+        "color": str(counter.get("color", "") or ""),
+        "glyphColor": str(counter.get("glyphColor", "") or ""),
+        "textColor": str(counter.get("textColor", "") or ""),
+        "style": str(counter.get("style", "") or ""),
+        "bar": counter.get("bar") is not False,
+        "interval": counter.get("interval"),
+        "defaultInterval": provider.default_interval if provider else None,
+        "minInterval": provider.min_interval if provider else None,
+        "effectiveInterval": None,
+        "rateLimited": False,
+        "nextFetchAt": None,
+        "value": None,
+        "name": "",
+        "url": "",
+        "fetchedAt": None,
+        "error": None,
+        "deltaDay": None,
+        "deltaWeek": None,
+        "tooltip": "",
+    }
+    if provider is None:
+        row["error"] = "unknown counter type %r" % row["type"]
+        return None, row
+    try:
+        row["target"] = provider.normalize(row["target"])
+    except ValueError as error:
+        row["error"] = str(error)
+        return None, row
+    row["key"] = counter_key(row)
+    row["url"] = provider.url(row["target"])
+    return provider, row
+
+
+def fetch_all(counters, max_age_minutes=DEFAULT_INTERVAL_MINUTES, force=False, now=None):
+    """Fetch every counter that is due, fold in the cache, return the report.
+
+    A counter is due when it has never been fetched, when its interval has
+    elapsed, or when --force says so — except that a provider's rate cap
+    (`min_interval`) always holds: a forced fetch inside the cap serves the
+    cached value and marks the row rateLimited. Failures keep the last good
+    value on screen and retry after ERROR_RETRY_MINUTES (or the cap, if
+    that is longer).
+    """
+    now = time.time() if now is None else now
+    today = local_today()
+    secrets = load_secrets()
+    state = load_state()
+    cache = state["counters"]
+
+    rows, jobs = [], []
+    for index, counter in enumerate(counters):
+        provider, row = resolve_counter(index, counter)
+        rows.append(row)
+        if provider is None:
+            continue
+        cached = cache.get(row["key"]) or {}
+        row["value"] = cached.get("value")
+        row["name"] = cached.get("name", "")
+        row["fetchedAt"] = cached.get("fetchedAt")
+        row["error"] = cached.get("error")
+        interval = effective_interval(provider, row["interval"], max_age_minutes)
+        row["effectiveInterval"] = int(interval) if float(interval).is_integer() else interval
+        cap = float(provider.min_interval or 1) * 60
+        last_ok = float(cached.get("fetchedAtEpoch") or 0)
+        last_try = float(cached.get("attemptedAtEpoch") or 0)
+        since_ok = now - last_ok
+        due = force or row["value"] is None or since_ok >= interval * 60
+        if due and row["value"] is not None and since_ok < cap:
+            # Inside the provider's rate cap: nothing is fetched, forced or not.
+            due = False
+            row["rateLimited"] = True
+        backoff = max(ERROR_RETRY_MINUTES * 60, cap)
+        if due and not force and row["error"] and (now - last_try) < backoff:
+            due = False
+        if due:
+            jobs.append((provider, row))
+        elif row["error"]:
+            # A failed counter is tried again once the backoff has passed
+            # (and, when it still holds a number, once that is due).
+            row["nextFetchAt"] = iso_at(max(last_ok + interval * 60 if row["value"] is not None else 0, last_try + backoff))
+        elif cached.get("fetchedAtEpoch") is not None:
+            row["nextFetchAt"] = iso_at(last_ok + interval * 60)
+
+    def work(job):
+        provider, row = job
+        try:
+            return row, provider.fetch(row["target"], secrets), None
+        except CounterError as error:
+            return row, None, str(error)
+        except Exception as error:  # a provider bug must not take the others down
+            return row, None, "%s: %s" % (type(error).__name__, error)
+
+    if jobs:
+        with ThreadPoolExecutor(max_workers=min(4, len(jobs))) as pool:
+            for row, result, error in pool.map(work, jobs):
+                cached = cache.setdefault(row["key"], {})
+                cached["attemptedAtEpoch"] = now
+                if result is not None:
+                    history = prune_history(cached.get("history") or {}, today)
+                    history[today.isoformat()] = result.value
+                    cached.update({
+                        "value": result.value,
+                        "name": result.name,
+                        "url": result.url or row["url"],
+                        "fetchedAt": dt.datetime.fromtimestamp(now).isoformat(timespec="seconds"),
+                        "fetchedAtEpoch": now,
+                        "error": None,
+                        "history": history,
+                    })
+                else:
+                    cached["error"] = error
+                row["value"] = cached.get("value")
+                row["name"] = cached.get("name", "")
+                row["fetchedAt"] = cached.get("fetchedAt")
+                row["error"] = cached.get("error")
+                interval = float(row["effectiveInterval"] or max_age_minutes)
+                if row["error"]:
+                    provider_cap = max(1.0, float(provider.min_interval or 1)) * 60
+                    row["nextFetchAt"] = iso_at(now + max(ERROR_RETRY_MINUTES * 60, provider_cap))
+                else:
+                    row["nextFetchAt"] = iso_at(now + interval * 60)
+
+    # Drop cache entries for counters that are no longer configured.
+    live_keys = {row["key"] for row in rows if "key" in row}
+    for key in list(cache):
+        if key not in live_keys:
+            del cache[key]
+    save_state(state)
+
+    for row in rows:
+        provider = PROVIDERS.get(row["type"])
+        if row.get("key") and row["value"] is not None:
+            history = (cache.get(row["key"]) or {}).get("history") or {}
+            row["deltaDay"], row["deltaWeek"] = history_deltas(history, row["value"], today)
+        if not row["label"]:
+            row["label"] = row["name"] or (provider.label if provider else row["type"])
+        row.pop("key", None)
+        try:
+            row["tooltip"] = str(provider.tooltip(row) if provider else default_tooltip(row))
+        except Exception as error:  # a tooltip bug must not blank the row
+            row["tooltip"] = default_tooltip(row) + "\ntooltip: %s" % error
+
+    return {
+        "generatedAt": dt.datetime.fromtimestamp(now).isoformat(timespec="seconds"),
+        "configured": len(counters) > 0,
+        "counters": rows,
+    }
+
+
+# ------------------------------------------------------------------ terminal
+
+
+def use_gum():
+    return have("gum") and sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def heading(text):
+    if use_gum():
+        print()
+        subprocess.run(["gum", "style", "--bold", "--foreground", "4", text])
+    else:
+        print("\n== " + text)
+
+
+def note(text):
+    if use_gum():
+        subprocess.run(["gum", "style", "--faint", "--width", "76", text])
+    else:
+        print(textwrap.fill(text, 72, initial_indent="   ", subsequent_indent="   "))
+
+
+# gum draws its interface on stderr so the answer can be read from stdout.
+# Capture stdout only: capturing stderr too swallows the prompt, the list and
+# the cursor, and the user types into nothing.
+def gum_output(argv):
+    result = subprocess.run(argv, stdout=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        raise KeyboardInterrupt
+    return result.stdout.rstrip("\n")
+
+
+def ask(prompt, placeholder="", password=False):
+    if use_gum():
+        argv = ["gum", "input", "--prompt", prompt + " ", "--placeholder", placeholder, "--width", "80"]
+        if password:
+            argv.append("--password")
+        value = gum_output(argv)
+        # gum clears its line on submit; leave a record of what was entered.
+        shown = ("•" * min(len(value), 12)) if password else value
+        print("%s %s" % (prompt, shown))
+        return value
+    return input(prompt + " ")
+
+
+def flush_tty_input():
+    """Drop keystrokes already queued on the terminal. A link pasted with a
+    trailing newline, or an Enter typed out of habit, would otherwise land on
+    the next chooser and take its preselected first option unseen."""
+    try:
+        import termios
+        with open("/dev/tty") as tty:
+            termios.tcflush(tty.fileno(), termios.TCIFLUSH)
+    except (ImportError, OSError, ValueError):
+        pass
+
+
+def confirm(prompt, default=True):
+    flush_tty_input()
+    if use_gum():
+        argv = ["gum", "confirm", prompt]
+        if not default:
+            argv.append("--default=false")
+        return subprocess.run(argv).returncode == 0
+    suffix = "[Y/n]" if default else "[y/N]"
+    answer = input("%s %s " % (prompt, suffix)).strip().lower()
+    if not answer:
+        return default
+    return answer.startswith("y")
+
+
+def choose(header, options):
+    """options: list of (value, label). Returns the chosen value."""
+    labels = [label for _, label in options]
+    flush_tty_input()
+    if use_gum():
+        picked = gum_output(["gum", "choose", "--header=" + header] + labels).strip()
+        for value, label in options:
+            if label == picked:
+                print("%s %s" % (header, label))
+                return value
+        raise KeyboardInterrupt
+    print(header)
+    for number, label in enumerate(labels, 1):
+        print("  %d) %s" % (number, label))
+    raw = input("Choice [1]: ").strip()
+    try:
+        return options[int(raw or 1) - 1][0]
+    except (ValueError, IndexError):
+        return options[0][0]
+
+
+def interactive():
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def fail(message, code=1):
+    print("omacounter: " + message, file=sys.stderr)
+    sys.exit(code)
+
+
+def shlex_quote(text):
+    import shlex
+    return shlex.quote(str(text))
+
+
+def format_number(value):
+    return "{:,}".format(value) if isinstance(value, int) else "—"
+
+
+# ---------------------------------------------------------------- credentials
+
+
+def credential_for_id(cred_id):
+    cred = CREDENTIALS.get(str(cred_id or ""))
+    if cred is None:
+        fail("unknown credential %r — one of: %s" % (cred_id, ", ".join(CREDENTIALS) or "(none)"), 64)
+    return cred
+
+
+def credential_users(cred_id):
+    return providers.users_of(PROVIDERS, read_counters() or [], cred_id)
+
+
+def try_verify(cred, value):
+    """Verify, print the outcome, return True when it passed."""
+    print("  Checking it against %s… " % cred.label.split(" ")[0], end="", flush=True)
+    try:
+        cred.verify(value)
+        print("works.")
+        return True
+    except CounterError as error:
+        print("no.")
+        note(str(error))
+        hint = cred.hint_for(error)
+        if hint:
+            note(hint)
+        return False
+
+
+def setup_credential(cred, secrets):
+    """The walk-through for one credential. Returns True when a value is stored."""
+    heading(cred.label)
+    existing = cred.from_file(secrets)
+    if existing:
+        note("There is already one: %s" % cred.masked(existing))
+        if not confirm("Replace it?", False):
+            return True
+    elif cred.from_env():
+        note("%s is set in the environment; nothing to store." % cred.env)
+        return True
+    if cred.help:
+        note(cred.help)
+    if cred.console_url:
+        print("  " + cred.console_url)
+        if have("xdg-open") and confirm("Open that page in your browser?"):
+            subprocess.Popen(["xdg-open", cred.console_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for attempt in range(3):
+        flush_tty_input()
+        value = ask("Paste the %s:" % cred.label, cred.placeholder, password=True).strip()
+        if not value:
+            print("  Nothing pasted.")
+            continue
+        if not cred.shape.match(value):
+            print("  That does not look like a %s — %s." % (cred.label, cred.shape_help))
+            continue
+        if not try_verify(cred, value):
+            if attempt < 2:
+                continue
+            if not confirm("Save it anyway?", False):
+                return False
+        cred.store(secrets, value)
+        save_secrets(secrets)
+        note("Saved to " + SECRETS_PATH)
+        return True
+    return False
+
+
+def ensure_credential(provider, secrets, allow_prompt):
+    """True when the provider's credential (if any) is available, prompting
+    for it when a terminal is there to ask in."""
+    cred = provider.credential
+    if cred is None or cred.present(secrets):
+        return True
+    if allow_prompt and interactive():
+        return setup_credential(cred, secrets)
+    return False
+
+
+# ------------------------------------------------------------------- commands
+
+
+def cmd_types(_args):
+    for provider in PROVIDERS.values():
+        needs = ("needs " + provider.credential.label) if provider.credential else "no key"
+        cap = "at most every %d min" % provider.min_interval
+        if provider.rate_note:
+            cap += " (%s)" % provider.rate_note
+        print("%-20s %s  %s" % (provider.id, provider.icon, provider.label))
+        print("%-24s%s" % ("", provider.describe or ""))
+        print("%-24starget: %s  e.g. %s" % ("", provider.target_help, provider.example))
+        print("%-24s%s; %s" % ("", needs, cap))
+    for name, error in providers.LOAD_ERRORS:
+        print("! providers/%s did not load: %s" % (name, error))
+
+
+def cmd_fetch(args):
+    if args.counters is not None:
+        try:
+            counters = json.loads(args.counters)
+        except ValueError:
+            fail("--counters is not valid JSON", 64)
+        if not isinstance(counters, list):
+            fail("--counters must be a JSON array", 64)
+        counters = [c for c in counters if isinstance(c, dict)]
+    else:
+        counters = read_counters() or []
+    report = fetch_all(counters, max_age_minutes=args.max_age, force=args.force)
+    if args.pretty:
+        print_report(report, args.max_age)
+    else:
+        json.dump(report, sys.stdout, ensure_ascii=False)
+        print()
+
+
+def interval_note(row, refresh_minutes):
+    """'every 15 min', with why when it is not the widget's norm: 'own' for
+    a counter's own interval, 'source' for a type's default, 'cap' when a
+    rate cap raised it. Worked out from the row's fields against the
+    widget's refreshMinutes, the same way the fetch loop does."""
+    if row.get("minInterval") is None:
+        return ""
+    requested = row.get("interval") or row.get("defaultInterval") or refresh_minutes or DEFAULT_INTERVAL_MINUTES
+    effective = max(float(requested), float(row.get("minInterval") or 1))
+    minutes = int(effective) if effective.is_integer() else effective
+    note = "every %s min" % minutes
+    if effective > float(requested):
+        note += " (cap)"
+    elif row.get("interval"):
+        note += " (own)"
+    elif row.get("defaultInterval"):
+        note += " (source)"
+    return note
+
+
+def print_report(report, refresh_minutes=None):
+    if not report["counters"]:
+        print("No counters configured. Add one with: omacounter add <link>")
+        return
+    for row in report["counters"]:
+        line = "%2d. %s %-28s %14s %-26s %s" % (row["index"] + 1, row["icon"], row["label"][:28], format_number(row["value"]),
+                                                 row["unit"], interval_note(row, refresh_minutes))
+        if row["deltaDay"] is not None:
+            line += "   %+d today" % row["deltaDay"]
+        if not row.get("bar", True):
+            line += "   (panel only)"
+        if row["error"]:
+            line += "   ! " + row["error"]
+        print(line.rstrip())
+
+
+def cmd_list(_args):
+    counters = read_counters()
+    if counters is None:
+        print("The widget is not on the bar yet. Run: omacounter setup")
+        return
+    if not counters:
+        print("No counters yet. Add one with: omacounter add <link>")
+        return
+    report = fetch_all(counters, max_age_minutes=10 ** 6)  # cache only, no network
+    print_report(report, widget_refresh_minutes())
+
+
+DEFAULT_KEYS = ("icon", "glyphColor", "textColor")
+
+
+def fill_defaults(counter):
+    """Write the source's default glyph and colours onto the counter, where
+    it has none of its own, so they sit in shell.json where they can be
+    tweaked. Returns the keys written."""
+    provider = PROVIDERS.get(str(counter.get("type", "")))
+    if provider is None:
+        return []
+    defaults = {"icon": provider.icon, "glyphColor": provider.brand_color, "textColor": provider.text_color}
+    written = []
+    for key in DEFAULT_KEYS:
+        if defaults[key] and not counter.get(key) and not (key != "icon" and counter.get("color")):
+            counter[key] = defaults[key]
+            written.append(key)
+    return written
+
+
+def parse_counter_flags(args, counter):
+    if args.label:
+        counter["label"] = args.label
+    if args.style:
+        counter["style"] = args.style
+    if args.color:
+        counter["color"] = args.color
+    if args.glyph_color:
+        counter["glyphColor"] = args.glyph_color
+    if args.text_color:
+        counter["textColor"] = args.text_color
+    if args.interval is not None:
+        apply_setting(counter, "interval", str(args.interval))
+    if args.icon:
+        counter["icon"] = args.icon
+    if getattr(args, "no_bar", False):
+        counter["bar"] = False
+    return counter
+
+
+def ensure_on_bar(interactive_flow):
+    """Make sure the widget is enabled so `counters` has an entry to live on."""
+    if read_counters() is not None:
+        return
+    enabled = plugin_enabled()
+    if enabled is None:
+        raise CounterError("the widget is not on the bar and `omarchy` is not available to enable it")
+    if interactive_flow:
+        heading("Enable the widget")
+        note("It is installed but not on the bar yet.")
+        if not confirm("Put the Counters widget on the bar now?"):
+            raise CounterError("not enabled; nothing was changed")
+    enable_plugin()
+    print("Enabled " + PLUGIN_ID)
+
+
+def verify_counter(provider, target):
+    """Fetch once, outside the cache, so a typo is caught before it is saved."""
+    return provider.fetch(target, load_secrets())
+
+
+def choose_metric(candidates):
+    """A link that can be counted more than one way: make the question
+    unmissable, then ask. Returns the chosen provider id."""
+    kind = candidates[0].target_kind or "link"
+    heading("That is a %s — count what?" % kind)
+    if use_gum():
+        note("↑ ↓ to pick, Enter to confirm.")
+    options = [(p.id, "%s  %s" % (p.icon, p.unit.capitalize())) for p in candidates]
+    return choose("Count what?", options)
+
+
+def pick_provider_for(raw):
+    """`add <link>` without a type: the link decides, and when it fits more
+    than one type (a video: likes or views) the user is asked, or told the
+    options when there is no terminal to ask in."""
+    candidates = detect_providers(raw)
+    if not candidates:
+        fail("%r is not %s that I recognise" % (raw, accepted_sentence()), 64)
+    if len(candidates) == 1:
+        return candidates[0]
+    if interactive():
+        try:
+            return PROVIDERS[choose_metric(candidates)]
+        except (KeyboardInterrupt, EOFError):
+            fail("cancelled")
+    hints = "\n".join("        omacounter add %s %s" % (p.id, shlex_quote(raw)) for p in candidates)
+    fail("that link can be counted more than one way; say which:\n" + hints, 64)
+
+
+def cmd_add(args):
+    if args.target is None:
+        # `add <link>`: the first argument is the target, the type is inferred.
+        if args.type in PROVIDERS:
+            fail("add needs a target after the type, e.g. add %s <link>" % args.type, 64)
+        args.target = args.type
+        provider = pick_provider_for(args.target)
+        args.type = provider.id
+    provider = PROVIDERS.get(args.type)
+    if provider is None:
+        if detect_providers(args.type):
+            fail("the type comes first: omacounter add <type> <target> — or just: omacounter add %s" % shlex_quote(args.type), 64)
+        fail("unknown type %r — see: omacounter types" % args.type, 64)
+    try:
+        target = provider.normalize(args.target)
+    except ValueError as error:
+        others = [p for p in detect_providers(args.target) if p is not provider]
+        if others:
+            hints = "\n".join("        Try: omacounter add %s %s" % (p.id, shlex_quote(args.target)) for p in others)
+            fail("%s: %s\n%s" % (args.type, error, hints), 64)
+        fail("%s: %s" % (args.type, error), 64)
+    try:
+        counter = parse_counter_flags(args, {"type": provider.id, "target": target})
+    except ValueError as error:
+        fail(str(error), 64)
+    fill_defaults(counter)
+    try:
+        ensure_on_bar(interactive_flow=False)
+        counters = read_counters() or []
+        for existing in counters:
+            if counter_key(existing) == counter_key(counter):
+                fail("already added as #%d" % (counters.index(existing) + 1))
+        if not args.no_verify:
+            if not ensure_credential(provider, load_secrets(), allow_prompt=True):
+                fail("no %s; nothing was added" % provider.credential.label)
+            result = verify_counter(provider, target)
+            print("%s %s: %s %s" % (provider.icon, result.name or target, format_number(result.value), provider.unit))
+        counters.append(counter)
+        write_counters(counters)
+    except (KeyboardInterrupt, EOFError):
+        print()
+        fail("cancelled")
+    except CounterError as error:
+        fail(str(error))
+    notify_widget()
+    print("Added #%d %s %s" % (len(counters), provider.id, target))
+
+
+def find_counter(counters, which):
+    """Index of the counter named by a 1-based number, a target, or a type:target key."""
+    which = str(which or "").strip()
+    if which.isdigit() and 1 <= int(which) <= len(counters):
+        return int(which) - 1
+    for i, counter in enumerate(counters):
+        if counter.get("target") == which or counter_key(counter) == which:
+            return i
+    return None
+
+
+COLOR_ROLES = ("foreground", "text", "accent", "urgent", "muted", "background")
+HEX_COLOR_RE = re.compile(r"^#(?:[0-9A-Fa-f]{3}|[0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})$")
+SETTABLE_KEYS = ("label", "style", "color", "glyphColor", "textColor", "interval", "icon", "bar", "target")
+TRUE_WORDS = ("true", "yes", "on", "show", "1")
+FALSE_WORDS = ("false", "no", "off", "hide", "0")
+
+
+def apply_setting(counter, key, raw):
+    """Set one key on a counter in place, validating the value. An empty value
+    removes the key so the widget's default applies again. Raises ValueError."""
+    if key not in SETTABLE_KEYS:
+        raise ValueError("unknown key %r — one of: %s" % (key, ", ".join(SETTABLE_KEYS)))
+    value = str(raw if raw is not None else "").strip()
+    if value == "":
+        if key == "target":
+            raise ValueError("target cannot be empty")
+        counter.pop(key, None)
+        return
+    if key == "style":
+        if value not in ("short", "long"):
+            raise ValueError("style is short or long")
+    elif key in ("color", "glyphColor", "textColor"):
+        if value.lower() not in COLOR_ROLES and not HEX_COLOR_RE.match(value):
+            raise ValueError("%s is foreground, accent, urgent, muted, or #rrggbb" % key)
+        value = value.lower() if value.lower() in COLOR_ROLES else value
+        if key == "color":
+            # `color` is glyph and number together; the separate colours
+            # (the brand colour `add` wrote, or earlier choices) would
+            # otherwise keep winning over it.
+            counter.pop("glyphColor", None)
+            counter.pop("textColor", None)
+    elif key == "interval":
+        try:
+            minutes = int(value)
+        except ValueError:
+            raise ValueError("interval is a whole number of minutes")
+        if minutes < 1:
+            raise ValueError("interval is at least 1 minute")
+        provider = PROVIDERS.get(str(counter.get("type", "")))
+        if provider is not None and minutes < (provider.min_interval or 1):
+            raise ValueError("%s can be fetched at most every %d minute%s%s" % (
+                provider.id, provider.min_interval, "" if provider.min_interval == 1 else "s",
+                (": " + provider.rate_note) if provider.rate_note else ""))
+        counter[key] = minutes
+        return
+    elif key == "bar":
+        word = value.lower()
+        if word in TRUE_WORDS:
+            counter.pop("bar", None)  # shown is the default; keep the entry minimal
+        elif word in FALSE_WORDS:
+            counter["bar"] = False
+        else:
+            raise ValueError("bar is on or off (show on the bar, or panel only)")
+        return
+    elif key == "target":
+        provider = PROVIDERS.get(str(counter.get("type", "")))
+        if provider is None:
+            raise ValueError("unknown counter type %r" % counter.get("type"))
+        value = provider.normalize(value)
+    counter[key] = value
+
+
+def cmd_set(args):
+    counters = read_counters()
+    if not counters:
+        fail("no counters to change")
+    index = find_counter(counters, args.which)
+    if index is None:
+        fail("no counter matches %r — run: omacounter list" % args.which)
+    counter = counters[index]
+    try:
+        apply_setting(counter, args.key, args.value)
+        if args.key == "target":
+            provider = PROVIDERS[counter["type"]]
+            result = verify_counter(provider, counter["target"])
+            print("%s %s: %s %s" % (provider.icon, result.name or counter["target"], format_number(result.value), provider.unit))
+        write_counters(counters)
+    except ValueError as error:
+        fail(str(error), 64)
+    except CounterError as error:
+        fail(str(error))
+    notify_widget()
+    shown = counter.get(args.key)
+    print("#%d %s %s: %s" % (index + 1, counter.get("type"), counter.get("target"),
+                             ("%s = %s" % (args.key, json.dumps(shown, ensure_ascii=False))) if shown is not None else args.key + " cleared"))
+
+
+def cmd_remove(args):
+    counters = read_counters()
+    if not counters:
+        fail("no counters to remove")
+    index = find_counter(counters, args.which)
+    if index is None:
+        fail("no counter matches %r — run: omacounter list" % args.which)
+    removed = counters.pop(index)
+    try:
+        write_counters(counters)
+    except CounterError as error:
+        fail(str(error))
+    notify_widget()
+    print("Removed %s %s" % (removed.get("type"), removed.get("target")))
+
+
+# ------------------------------------------------------------------- ordering
+# The one order everything shows (the Python twin of Model.js): groups in
+# order of first appearance, each group's counters in configured order. A
+# move rewrites the list in that order, so `list` numbers what the panel and
+# the bar show.
+
+MOVE_WORDS = ("up", "down", "top", "bottom")
+
+
+def group_of(counter):
+    provider = PROVIDERS.get(str(counter.get("type", "")))
+    return provider.group_key if provider else "other"
+
+
+def group_label_of(counter):
+    provider = PROVIDERS.get(str(counter.get("type", "")))
+    return provider.group_name if provider else "Other"
+
+
+def group_rows(counters):
+    """[(key, [indices])] in order of first appearance."""
+    groups, by_key = [], {}
+    for i, counter in enumerate(counters):
+        key = group_of(counter)
+        if key not in by_key:
+            by_key[key] = [key, []]
+            groups.append(by_key[key])
+        by_key[key][1].append(i)
+    return [(key, indices) for key, indices in groups]
+
+
+def in_panel_order(counters):
+    return [counters[i] for _, ids in group_rows(counters) for i in ids]
+
+
+def moved_position(p, n, where):
+    q = {"up": p - 1, "down": p + 1, "top": 0, "bottom": n - 1}.get(where, p)
+    if q < 0 or q >= n or q == p:
+        return None
+    return q
+
+
+def shifted(items, p, q):
+    out = list(items)
+    out.insert(q, out.pop(p))
+    return out
+
+
+def move_counter(counters, index, where):
+    """The list with counter `index` moved within its group, or None when it
+    is already there."""
+    groups = group_rows(counters)
+    for k, (key, indices) in enumerate(groups):
+        if index not in indices:
+            continue
+        p = indices.index(index)
+        q = moved_position(p, len(indices), where)
+        if q is None:
+            return None
+        groups[k] = (key, shifted(indices, p, q))
+        return [counters[i] for _, ids in groups for i in ids]
+    return None
+
+
+def move_group(counters, key, where):
+    """The list with group `key` moved among the groups, or None."""
+    groups = group_rows(counters)
+    for k, (group_key, _) in enumerate(groups):
+        if group_key != key:
+            continue
+        q = moved_position(k, len(groups), where)
+        if q is None:
+            return None
+        return [counters[i] for _, ids in shifted(groups, k, q) for i in ids]
+    return None
+
+
+def find_group(counters, which):
+    """A group key named by its key or label (case-insensitive), or None."""
+    word = str(which or "").strip().lower()
+    if not word:
+        return None
+    for counter in counters:
+        if group_of(counter).lower() == word or group_label_of(counter).lower() == word:
+            return group_of(counter)
+    return None
+
+
+def cmd_move(args):
+    counters = read_counters()
+    if not counters:
+        fail("no counters to move")
+    where = str(args.where).lower()
+    if where not in MOVE_WORDS:
+        fail("where is one of: " + ", ".join(MOVE_WORDS), 64)
+    index = find_counter(counters, args.what)
+    if index is not None:
+        moved = move_counter(counters, index, where)
+        what = "%s %s" % (counters[index].get("type"), counters[index].get("target"))
+    else:
+        key = find_group(counters, args.what)
+        if key is None:
+            fail("no counter or group matches %r — run: omacounter list" % args.what)
+        moved = move_group(counters, key, where)
+        what = "the %s group" % group_label_of(next(c for c in counters if group_of(c) == key))
+    if moved is None:
+        print("%s is already at the %s" % (what, "top" if where in ("up", "top") else "bottom"))
+        return
+    try:
+        write_counters(moved)
+    except CounterError as error:
+        fail(str(error))
+    notify_widget()
+    print("Moved %s %s" % (what, where))
+    for i, counter in enumerate(moved):
+        print("  %d. %s %s" % (i + 1, counter.get("type"), counter.get("target")))
+
+
+def cmd_fill(_args):
+    """Write every counter's default glyph and colours into shell.json."""
+    counters = read_counters()
+    if not counters:
+        fail("no counters to fill")
+    changed = 0
+    for i, counter in enumerate(counters):
+        written = fill_defaults(counter)
+        if written:
+            changed += 1
+            print("#%d %s %s: %s" % (i + 1, counter.get("type"), counter.get("target"),
+                                     ", ".join("%s = %s" % (k, json.dumps(counter[k], ensure_ascii=False)) for k in written)))
+    if not changed:
+        print("Every counter already carries its glyph and colours.")
+        return
+    try:
+        write_counters(counters)
+    except CounterError as error:
+        fail(str(error))
+    notify_widget()
+    print("Filled %d counter%s; tweak them in %s" % (changed, "" if changed == 1 else "s", SHELL_JSON))
+
+
+def cmd_open(args):
+    counters = read_counters() or []
+    index = find_counter(counters, args.which)
+    if index is None:
+        fail("no counter matches %r — run: omacounter list" % args.which)
+    provider, row = resolve_counter(0, counters[index])
+    if provider is None or not row["url"]:
+        fail("nothing to open for that counter")
+    subprocess.Popen(["xdg-open", row["url"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def cmd_auth(args):
+    secrets = load_secrets()
+    if not args.cred:
+        if not CREDENTIALS:
+            print("No counter type needs a credential.")
+            return
+        for cred in CREDENTIALS.values():
+            where = cred.source(secrets) or "—"
+            users = credential_users(cred.id)
+            print("%-10s %-22s %-8s %-18s used by %d counter%s" % (
+                cred.id, cred.label, cred.kind, where, users, "" if users == 1 else "s"))
+        print("(%s)" % SECRETS_PATH)
+        return
+    cred = credential_for_id(args.cred)
+    action = args.action or "show"
+    if action == "show":
+        try:
+            value = cred.resolve(secrets)
+        except CounterError:
+            print("No %s set. Run: omacounter auth %s set" % (cred.label, cred.id))
+            return
+        source = cred.source(secrets)
+        print("%s  (%s)" % (cred.masked(value), SECRETS_PATH if source == "file" else source))
+    elif action == "clear":
+        cred.clear(secrets)
+        save_secrets(secrets)
+        print("Cleared the " + cred.label)
+    elif action == "check":
+        try:
+            cred.verify(cred.resolve(secrets))
+        except CounterError as error:
+            fail(str(error))
+        print("The %s works" % cred.label)
+    else:  # set
+        value = (args.value or "").strip()
+        if not value:
+            try:
+                flush_tty_input()
+                value = ask("Paste the %s:" % cred.label, cred.placeholder, password=True).strip()
+            except (KeyboardInterrupt, EOFError):
+                fail("cancelled")
+        if not cred.shape.match(value):
+            fail("that does not look like a %s (%s)" % (cred.label, cred.shape_help))
+        try:
+            cred.verify(value)
+        except CounterError as error:
+            hint = cred.hint_for(error)
+            if not interactive() or not confirm("Not accepted (%s). Save it anyway?" % (str(error) + ((" " + hint) if hint else "")), False):
+                fail(str(error))
+        cred.store(secrets, value)
+        save_secrets(secrets)
+        notify_widget()
+        print("Saved to " + SECRETS_PATH)
+
+
+def setup_counter(counters, secrets):
+    """Ask for one counter, verify it live, append it. Returns True if added.
+
+    The link comes first and decides the rest: a channel counts subscribers,
+    a video is asked whether to count likes or views, a repository counts
+    stars. Types are never named. A credential the chosen type needs and
+    that is not stored yet is set up right here, before the counter is
+    verified.
+    """
+    for _ in range(3):
+        raw = ask("Paste %s:" % accepted_sentence(), "paste it here").strip()
+        if not raw:
+            print("  Nothing pasted.")
+            continue
+        candidates = detect_providers(raw)
+        if not candidates:
+            print("  That is not %s that I recognise." % accepted_sentence())
+            continue
+        if len(candidates) == 1:
+            provider = candidates[0]
+        else:
+            provider = PROVIDERS[choose_metric(candidates)]
+        target = provider.normalize(raw)
+        for existing in counters:
+            if existing.get("type") == provider.id and existing.get("target") == target:
+                print("  That one is already on the bar.")
+                return False
+        if not ensure_credential(provider, secrets, allow_prompt=True):
+            print("  Without the %s this counter cannot be fetched." % provider.credential.label)
+            return False
+        print("  Checking… ", end="", flush=True)
+        try:
+            result = verify_counter(provider, target)
+        except CounterError as error:
+            print("failed: " + str(error))
+            if not confirm("Try a different link?"):
+                return False
+            continue
+        print("%s — %s %s" % (result.name or target, format_number(result.value), provider.unit))
+        counter = {"type": provider.id, "target": target}
+        label = ask("Label [%s]:" % (result.name or provider.label), "leave empty to keep it").strip()
+        if label:
+            counter["label"] = label
+        fill_defaults(counter)
+        counters.append(counter)
+        return True
+    return False
+
+
+def cmd_setup(_args):
+    heading("omacounter setup")
+    note("Old-school hit counters for your bar. This adds counters, sets up any key "
+         "they need, and puts the widget on the bar. Run it again any time.")
+    try:
+        secrets = load_secrets()
+        ensure_on_bar(interactive_flow=True)
+        counters = read_counters() or []
+
+        heading("Counters")
+        if counters:
+            report = fetch_all(counters, max_age_minutes=10 ** 6)
+            print_report(report, widget_refresh_minutes())
+            # A counter whose credential went missing is worth fixing here.
+            for row in report["counters"]:
+                provider = PROVIDERS.get(row["type"])
+                if provider and provider.credential and not provider.credential.present(secrets):
+                    note("#%d needs the %s, which is not set." % (row["index"] + 1, provider.credential.label))
+                    if confirm("Set it up now?"):
+                        setup_credential(provider.credential, secrets)
+        else:
+            note("None yet.")
+        added = 0
+        while confirm("Add a counter?" if not counters else "Add another counter?", not counters):
+            if setup_counter(counters, secrets):
+                added += 1
+                write_counters(counters)
+        if added:
+            note("Added %d. Change a label, colour or interval later with "
+                 "omacounter set <n> <key> <value>, or edit ~/.config/omarchy/shell.json." % added)
+
+        link = os.path.join(HOME, ".local", "bin", "omacounter")
+        if not os.path.exists(link):
+            heading("Command line")
+            if confirm("Link 'omacounter' into ~/.local/bin?"):
+                do_install(force=False)
+    except (KeyboardInterrupt, EOFError):
+        print()
+        fail("cancelled")
+    except CounterError as error:
+        fail(str(error))
+
+    notify_widget()
+    heading("Done")
+    note("The bar refreshes itself every %d minutes; middle-click the widget to refresh now, "
+         "click it for the panel." % DEFAULT_INTERVAL_MINUTES)
+
+
+def owns_link(path):
+    return os.path.islink(path) and os.path.realpath(path) == os.path.realpath(os.path.join(SCRIPT_DIR, "omacounter"))
+
+
+def do_install(force):
+    link = os.path.join(HOME, ".local", "bin", "omacounter")
+    if (os.path.exists(link) or os.path.islink(link)) and not owns_link(link) and not force:
+        print("omacounter: %s already exists and was not put there by this plugin." % link, file=sys.stderr)
+        print("        Left alone. Re-run as `omacounter install --force` to replace it.", file=sys.stderr)
+        return 1
+    os.makedirs(os.path.dirname(link), exist_ok=True)
+    if os.path.lexists(link):
+        os.unlink(link)
+    os.symlink(os.path.join(SCRIPT_DIR, "omacounter"), link)
+    print("Linked " + link)
+    if os.path.dirname(link) not in os.environ.get("PATH", "").split(":"):
+        print("Note: %s is not on your PATH." % os.path.dirname(link))
+    return 0
+
+
+def cmd_install(args):
+    sys.exit(do_install(args.force))
+
+
+def cmd_doctor(args):
+    status = 0
+    print("Python %d.%d  (%s)" % (sys.version_info[0], sys.version_info[1], sys.executable))
+    print("Plugin root: " + ROOT_DIR)
+    print()
+    print("Omarchy:")
+    if have("omarchy"):
+        print("  ok       omarchy on PATH")
+    else:
+        print("  MISSING  omarchy is not on PATH — counters can still be fetched, not managed")
+        status = 1
+    if have("omarchy-shell"):
+        ping = run(["omarchy-shell", "shell", "ping"], timeout=5)
+        print("  ok       shell is running" if ping.stdout.strip() == "ok" else "  absent   shell is not running")
+    enabled = plugin_enabled()
+    if enabled is True:
+        print("  ok       %s is on the bar" % PLUGIN_ID)
+    elif enabled is False:
+        print("  absent   %s is installed but not on the bar — run: omacounter setup" % PLUGIN_ID)
+    else:
+        print("  unknown  could not list plugins")
+    print()
+    print("Providers (%s):" % providers.PROVIDERS_DIR)
+    print("  ok       %d types: %s" % (len(PROVIDERS), ", ".join(PROVIDERS)))
+    for name, error in providers.LOAD_ERRORS:
+        print("  FAIL     providers/%s: %s" % (name, error))
+        status = 1
+    print()
+    counters = read_counters()
+    print("Credentials (%s):" % SECRETS_PATH)
+    secrets = load_secrets()
+    if not CREDENTIALS:
+        print("  none     no type needs one")
+    for cred in CREDENTIALS.values():
+        users = providers.users_of(PROVIDERS, counters or [], cred.id)
+        if cred.present(secrets):
+            print("  ok       %s present (%s, from %s)" % (cred.label, cred.masked(cred.resolve(secrets)), cred.source(secrets)))
+            if args.online:
+                try:
+                    cred.verify(cred.resolve(secrets))
+                    print("  ok       %s accepted" % cred.label)
+                except CounterError as error:
+                    print("  FAIL     %s: %s" % (cred.label, error))
+                    status = 1
+        elif users:
+            print("  MISSING  %s, needed by %d counter%s — run: omacounter auth %s set" % (cred.label, users, "" if users == 1 else "s", cred.id))
+            status = 1
+        else:
+            print("  absent   %s (no counter needs it)" % cred.label)
+    print()
+    print("Counters:")
+    if counters is None:
+        print("  none     the widget has no entry in " + shell_config_path())
+    elif not counters:
+        print("  none     add one with: omacounter add <link>")
+    else:
+        # Cache only unless --online; the interval shown is the one the
+        # widget will actually use, computed with its own refreshMinutes.
+        widget_minutes = widget_refresh_minutes()
+        report = fetch_all(counters, max_age_minutes=0 if args.online else 10 ** 6)
+        for row in report["counters"]:
+            mark = "FAIL" if row["error"] else "ok  "
+            provider = PROVIDERS.get(row["type"])
+            every = ""
+            if provider is not None:
+                minutes = effective_interval(provider, row["interval"], widget_minutes)
+                minutes = int(minutes) if float(minutes).is_integer() else minutes
+                every = "   every %s min" % minutes
+                try:
+                    asked = int(row["interval"]) if row["interval"] not in (None, "") else None
+                except (TypeError, ValueError):
+                    asked = None
+                if asked is not None and asked < minutes:
+                    every += "  (interval %d raised to the %s cap of %s min)" % (asked, row["type"], minutes)
+            print("  %s     #%d %s %s → %s %s%s%s" % (
+                mark, row["index"] + 1, row["type"], row["target"], format_number(row["value"]), row["unit"],
+                ("  (" + row["error"] + ")") if row["error"] else "", every))
+            if row["error"]:
+                status = 1
+    print()
+    print("All good." if status == 0 else "Something needs attention.")
+    sys.exit(status)
+
+
+def cmd_refresh(_args):
+    notify_widget()
+
+
+# ----------------------------------------------------------------------- main
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="omacounter",
+        description="Hit counters for the Omarchy bar.",
+        epilog="Counter types: " + ", ".join(PROVIDERS) + ". Run `omacounter types` for details.",
+    )
+    parser.add_argument("--version", action="version", version="omacounter " + VERSION)
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("setup", help="guided setup: counters, the keys they need, put the widget on the bar").set_defaults(func=cmd_setup)
+
+    add = sub.add_parser("add", help="add a counter: `add <link>` asks what to count; `add <type> <link>` says it")
+    add.add_argument("type", help="counter type (see `types`), or just the link when the type should be inferred")
+    add.add_argument("target", nargs="?", help="channel, video, repository, … depending on the type")
+    add.add_argument("--label", help="name shown in the panel (default: the resolved title)")
+    add.add_argument("--style", choices=["short", "long"], help="12.3K or 12,345 on the bar")
+    add.add_argument("--color", help="glyph and number together: foreground, accent, urgent, muted, or #rrggbb")
+    add.add_argument("--glyph-color", help="the glyph only (same values as --color)")
+    add.add_argument("--text-color", help="the number only (same values as --color)")
+    add.add_argument("--interval", type=int, help="refresh interval in minutes for this counter (not below the type's cap)")
+    add.add_argument("--icon", help="glyph shown before the number")
+    add.add_argument("--no-bar", action="store_true", help="keep it off the bar: panel only (`set <n> bar on` shows it later)")
+    add.add_argument("--no-verify", action="store_true", help="save without fetching once first")
+    add.set_defaults(func=cmd_add)
+
+    set_ = sub.add_parser("set", help="change one setting on a counter, e.g. `set 1 glyphColor '#FF0000'`")
+    set_.add_argument("which", help="counter number from `list`, or its target")
+    set_.add_argument("key", help="one of: " + ", ".join(SETTABLE_KEYS))
+    set_.add_argument("value", help="the new value; empty (\"\") clears the key so the widget default applies")
+    set_.set_defaults(func=cmd_set)
+
+    remove = sub.add_parser("remove", help="remove a counter by number (see `list`) or target")
+    remove.add_argument("which")
+    remove.set_defaults(func=cmd_remove)
+
+    move = sub.add_parser("move", help="reorder: a counter within its group, or a whole group, e.g. `move 3 up`, `move github top`")
+    move.add_argument("what", help="counter number from `list` or its target; or a group (youtube, github, …)")
+    move.add_argument("where", choices=list(MOVE_WORDS))
+    move.set_defaults(func=cmd_move)
+
+    sub.add_parser("list", help="show the configured counters and their last values").set_defaults(func=cmd_list)
+    sub.add_parser("fill", help="write each counter's default glyph and colours into shell.json, where they can be tweaked").set_defaults(func=cmd_fill)
+
+    fetch = sub.add_parser("fetch", help="fetch what is due and print the report as JSON (what the widget runs)")
+    fetch.add_argument("--counters", help="JSON array of counters instead of reading shell.json")
+    fetch.add_argument("--max-age", type=float, default=DEFAULT_INTERVAL_MINUTES, metavar="MINUTES",
+                       help="refetch a counter older than this unless it sets its own interval")
+    fetch.add_argument("--force", action="store_true", help="refetch everything now (within each type's rate cap)")
+    fetch.add_argument("--pretty", action="store_true", help="a table instead of JSON")
+    fetch.set_defaults(func=cmd_fetch)
+
+    open_ = sub.add_parser("open", help="open a counter's page in the browser")
+    open_.add_argument("which", help="counter number from `list`, or its target")
+    open_.set_defaults(func=cmd_open)
+
+    auth = sub.add_parser("auth", help="manage stored keys and tokens: `auth` lists them, `auth <id> set|show|check|clear`")
+    auth.add_argument("cred", nargs="?", help="credential id from `auth` or `types`, e.g. youtube")
+    auth.add_argument("action", nargs="?", choices=["show", "set", "check", "clear"])
+    auth.add_argument("value", nargs="?", help="the key or token, for `set` (prompted when omitted)")
+    auth.set_defaults(func=cmd_auth)
+
+    key = sub.add_parser("key", help="alias for `auth youtube …`")
+    key.add_argument("action", nargs="?", default="show", choices=["show", "set", "check", "clear"])
+    key.add_argument("value", nargs="?", help="the key, for `set` (prompted when omitted)")
+    key.set_defaults(func=cmd_auth, cred="youtube")
+
+    doctor = sub.add_parser("doctor", help="check the install, the providers, the credentials and every counter")
+    doctor.add_argument("--online", action="store_true", help="also hit each API for the credentials and counters")
+    doctor.set_defaults(func=cmd_doctor)
+
+    install = sub.add_parser("install", help="link omacounter into ~/.local/bin")
+    install.add_argument("--force", action="store_true", help="replace a file this plugin does not own")
+    install.set_defaults(func=cmd_install)
+
+    sub.add_parser("types", help="list the available counter types, what they need and how often they may be polled").set_defaults(func=cmd_types)
+    sub.add_parser("refresh", help="tell the running widget to refetch now").set_defaults(func=cmd_refresh)
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not args.command:
+        parser.print_help()
+        return 0
+    try:
+        args.func(args)
+    except BrokenPipeError:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

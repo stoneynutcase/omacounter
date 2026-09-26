@@ -1,0 +1,13 @@
+# Nothing the plugin produces at runtime lives in the checkout:
+#
+#   ~/.config/omarchy/shell.json              the counters, on the widget's entry
+#   ~/.config/omacounter/secrets.json    the YouTube API key
+#   ~/.local/state/omacounter/           cache and daily history
+
+__pycache__/
+*.pyc
+
+# Editor and OS strays
+*.swp
+*~
+.DS_Store

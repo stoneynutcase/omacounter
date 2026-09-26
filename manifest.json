@@ -1,0 +1,119 @@
+{
+  "schemaVersion": 1,
+  "id": "stoneynutcase.omacounter",
+  "name": "Omacounter",
+  "version": "0.2.0",
+  "author": "stoneynutcase",
+  "license": "MIT",
+  "description": "Old-school hit counters in the Omarchy bar: YouTube subscribers, video likes and views, GitHub stars, issues, pull requests and cloners, Mastodon followers, posts and hashtag activity; every source is one small file.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Counters",
+    "description": "Click: counter panel. Middle click: refresh now. Right click: notification summary.",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshMinutes": 15,
+      "style": "short",
+      "barMode": "all",
+      "cycleSeconds": 5,
+      "maxBarItems": 0,
+      "barMaxWidth": 480,
+      "glyphColor": "",
+      "textColor": "",
+      "monochrome": false,
+      "counters": []
+    },
+    "schema": [
+      {
+        "key": "refreshMinutes",
+        "type": "integer",
+        "label": "Refresh interval (minutes)",
+        "description": "How often counters are fetched again unless a counter sets its own interval. YouTube updates its statistics at most every few minutes and every fetch costs one API quota unit of 10,000 a day.",
+        "min": 1,
+        "max": 1440,
+        "step": 1,
+        "defaultValue": 15
+      },
+      {
+        "key": "style",
+        "type": "enum",
+        "label": "Number style on the bar",
+        "description": "short: 12.3K. long: 12,345. A counter can override this with its own style. The panel always shows the exact number.",
+        "options": [
+          "short",
+          "long"
+        ],
+        "defaultValue": "short"
+      },
+      {
+        "key": "barMode",
+        "type": "enum",
+        "label": "Bar layout",
+        "description": "all: every counter side by side. cycle: one counter at a time, rotating.",
+        "options": [
+          "all",
+          "cycle"
+        ],
+        "defaultValue": "all"
+      },
+      {
+        "key": "cycleSeconds",
+        "type": "integer",
+        "label": "Cycle interval (seconds)",
+        "description": "How long each counter stays on the bar in cycle mode.",
+        "min": 2,
+        "max": 120,
+        "step": 1,
+        "defaultValue": 5
+      },
+      {
+        "key": "maxBarItems",
+        "type": "integer",
+        "label": "Counters on the bar",
+        "description": "Limit how many counters the bar shows (0 = all). The panel always lists every counter.",
+        "min": 0,
+        "max": 20,
+        "step": 1,
+        "defaultValue": 0
+      },
+      {
+        "key": "barMaxWidth",
+        "type": "integer",
+        "label": "Bar width budget (px)",
+        "description": "Widest the counters may be on the bar. Counters that do not fit collapse into a +N chip; hover it for their numbers, click it for the panel. 0 = no limit.",
+        "min": 0,
+        "max": 4000,
+        "step": 10,
+        "defaultValue": 480
+      },
+      {
+        "key": "glyphColor",
+        "type": "string",
+        "label": "Glyph colour",
+        "description": "Default colour of every counter's glyph: foreground, accent, urgent, muted, or #rrggbb. Empty follows the bar. A counter's own glyphColor or color wins.",
+        "defaultValue": ""
+      },
+      {
+        "key": "textColor",
+        "type": "string",
+        "label": "Number colour",
+        "description": "Default colour of every counter's number, same values. Empty follows the bar. A counter's own textColor or color wins.",
+        "defaultValue": ""
+      },
+      {
+        "key": "monochrome",
+        "type": "boolean",
+        "label": "Monochrome",
+        "description": "Drop every brand and per-counter colour, on the bar and in the panel. Glyphs and numbers take the glyph and number colours above, which is the bar foreground unless set.",
+        "defaultValue": false
+      }
+    ]
+  }
+}

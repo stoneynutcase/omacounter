@@ -1,0 +1,43 @@
+name: Checks
+
+# Offline tests: the CLI's parsing, cache and report logic under python, and
+# Model.js under node. Nothing to install, so they run on every push and
+# pull request. Actions are pinned to a commit SHA, version in the comment.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  offline:
+    name: CLI and Model
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
+      - name: CLI (python)
+        run: python3 -m unittest discover -s test -v
+
+      - name: Model.js (node)
+        run: node --test --test-reporter=spec test/
+
+      - name: Manifest is valid JSON and the CLI and providers compile
+        run: |
+          python3 -c 'import json; json.load(open("manifest.json"))'
+          python3 -m py_compile bin/omacounter providers/*.py
+          test -x bin/omacounter
+          bin/omacounter types
