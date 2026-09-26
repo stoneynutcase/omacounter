@@ -7,6 +7,8 @@ stars, open issues, pull requests and unique cloners, Mastodon followers,
 posts and hashtag activity — and more are coming, since every source is one
 small file.
 
+![Omacounter: the counters on the bar and the panel below it](preview.png)
+
 The bar shows `󰗃 12.3K  󰔓 1.2K  󰓎 340  󰇚 51  󰫑 2.1K` in the order you
 configured; the panel shows the exact numbers on a split-flap display,
 grouped by service, with how much they moved today and this week, and a
@@ -14,6 +16,13 @@ click on a row opens the channel, video or repository. Opening the panel
 refreshes and flips only the digits that changed since you last looked, leaf
 by leaf; the first open and a hard refresh (`r`) count every card up from
 zero.
+
+![The bar](bar.png)
+
+In motion: a section dragged to the top, the row controls, a hard refresh
+counting every card up from zero, and monochrome switched on:
+
+![A tour of the panel](tour.gif)
 
 ## Requirements
 
@@ -150,7 +159,9 @@ Omarchy's plugin settings or `omarchy bar set stoneynutcase.omacounter <key> <va
 | `barMaxWidth` | 480 | width budget in px for the counters on the bar; what does not fit collapses into a `+N` chip whose tooltip lists the rest (0 = no limit) |
 | `glyphColor` | `""` | default glyph colour for counters without their own or a brand colour (empty = bar foreground) |
 | `textColor` | `""` | default number colour for counters without their own (empty = bar foreground) |
-| `monochrome` | `false` | `true` drops every brand and per-counter colour, on the bar and in the panel: glyphs take `glyphColor` (the bar foreground unless set) and numbers `textColor`, or a shade dimmer than the glyphs when that is unset so the two still read apart. `omarchy bar set stoneynutcase.omacounter monochrome true --json` |
+| `monochrome` | `false` | `true` drops every brand and per-counter colour, on the bar and in the panel: glyphs take `glyphColor` (the bar foreground unless set) and numbers `textColor`, or a shade dimmer than the glyphs when that is unset so the two still read apart. `omarchy bar set stoneynutcase.omacounter monochrome true --json`, or the `󱎕` in the panel's header |
+
+![Monochrome on: every glyph in the bar's colour, numbers a shade dimmer](monochrome.png)
 
 ## Using it
 
@@ -166,6 +177,8 @@ Omarchy's plugin settings or `omarchy bar set stoneynutcase.omacounter <key> <va
 | panel, `r` | hard refresh: every card resets to zero and counts up to the fresh number |
 | panel, `󱎕` in the header | toggle monochrome (see the widget setting below) |
 | panel, `a` / `Esc` | add / close |
+
+![A hovered row: drag handle, rename and show/hide at its start, remove at its end](row-controls.png)
 
 Numbers stay on screen when a fetch fails; the row says why, in the theme's
 urgent colour, and when it will try again (two minutes later, or the
