@@ -347,7 +347,7 @@ Shell log: `journalctl --user -o cat _COMM=quickshell`.
 
 ```bash
 python3 -m unittest discover -s test -v     # the CLI and providers, offline
-node --test test/                            # Model.js
+node --test "test/*.test.mjs"                            # Model.js
 ```
 
 Nothing to install. The Python tests load `bin/omacounter` as a module,
