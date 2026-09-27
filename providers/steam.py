@@ -16,7 +16,7 @@ DETAILS_API = "https://store.steampowered.com/api/appdetails"
 STORE_HOSTS = ("store.steampowered.com", "steamcommunity.com", "www.steamcommunity.com")
 APP_ID_RE = re.compile(r"^[1-9][0-9]{0,8}$")
 
-BRAND_COLOR = "#1A9FFF"   # the Steam client's highlight blue; the logo's navy vanishes on a dark bar
+BRAND_COLOR = ""   # none: the logo is drawn in the bar's own colour, white on a dark theme, as Steam draws it
 RATE_NOTE = "the store answers about 200 requests per 5 minutes per address"
 HELP = "a Steam game is its store URL (store.steampowered.com/app/<id>/…) or its app id"
 
