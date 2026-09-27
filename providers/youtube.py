@@ -125,7 +125,9 @@ def normalize_channel(raw):
     if CHANNEL_ID_RE.match(text):
         return text
     match = HANDLE_RE.match(text)
-    if match:
+    # A bare number is a Steam app id, not a handle; a handle that really is
+    # all digits still works written as @123 or as the channel URL.
+    if match and not (text.isdigit()):
         return "@" + match.group(1)
     raise ValueError("a channel is an @handle, a UC… id, or a channel URL")
 

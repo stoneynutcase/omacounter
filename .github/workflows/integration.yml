@@ -48,7 +48,7 @@ concurrency:
 
 jobs:
   keyless:
-    name: GitHub, Mastodon and Discord
+    name: GitHub, Mastodon, Discord and Steam
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -103,6 +103,8 @@ jobs:
               "  (GitHub's search endpoint allows 30 a minute with a token). For Discord,",
               "  `test_discord` failing on its own means the public invite route",
               "  (`/api/v10/invites/<code>?with_counts=true`) changed or now needs a token.",
+              "  `test_steam` alone means GetNumberOfCurrentPlayers or the store's appdetails",
+              "  route changed for app 730.",
               "- **YouTube (API)** calls the Data API with the `YOUTUBE_API_KEY` secret.",
               "  If only that job failed, check the key is still valid and the day's",
               "  10,000-unit quota is not used up before suspecting the code.",

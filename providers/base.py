@@ -18,7 +18,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 USER_AGENT = "omacounter/" + VERSION + " (+https://github.com/stoneynutcase/omacounter)"
 HTTP_TIMEOUT = 10
 MAX_RESPONSE_BYTES = 1024 * 1024

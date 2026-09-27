@@ -38,9 +38,9 @@ cli = load_cli()
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 import providers  # noqa: E402
-from providers import base, discord, github, mastodon, youtube  # noqa: E402
+from providers import base, discord, github, mastodon, steam, youtube  # noqa: E402
 
-SHARED_MODULES = {"base.py", "youtube.py", "mastodon.py", "github.py", "discord.py"}
+SHARED_MODULES = {"base.py", "youtube.py", "mastodon.py", "github.py", "discord.py", "steam.py"}
 
 
 class Sandbox(unittest.TestCase):
@@ -90,7 +90,7 @@ class Discovery(unittest.TestCase):
         self.assertEqual(set(cli.PROVIDERS), {"github.stars", "github.issues", "github.pulls", "github.clones",
                                               "mastodon.followers", "mastodon.posts", "mastodon.tag", "mastodon.tagpeople",
                                               "youtube.subscribers", "youtube.likes", "youtube.views",
-                                              "discord.members", "discord.online"})
+                                              "discord.members", "discord.online", "steam.players"})
         self.assertEqual(providers.LOAD_ERRORS, [])
         self.assertEqual(list(cli.PROVIDERS)[:4], ["github.stars", "github.issues", "github.pulls", "github.clones"])  # `order`, then file name
 
@@ -413,6 +413,59 @@ class Discord(Sandbox):
         self.assertEqual((rows[0]["group"], rows[0]["groupLabel"], rows[0]["brandColor"]), ("discord", "Discord", "#5865F2"))
         self.assertTrue(all(u.startswith("https://discord.com/api/v10/invites/") and "with_counts=true" in u for u in calls))
         self.assertEqual((rows[0]["minInterval"], rows[0]["effectiveInterval"]), (5, 15))
+
+
+class Steam(Sandbox):
+    def test_normalize(self):
+        n = steam.normalize_app
+        for raw in ("730", "https://store.steampowered.com/app/730/CounterStrike_2/", "store.steampowered.com/app/730",
+                    "https://steamcommunity.com/app/730", "https://store.steampowered.com/app/730/?snr=1_4_4__tab-Specials"):
+            self.assertEqual(n(raw), "730", raw)
+        for bad in ("", "0", "07", "dQw4w9WgXcQ", "12345678901", "@omarchy", "octocat/Hello-World", "https://store.steampowered.com/",
+                    "https://store.steampowered.com/bundle/1234", "https://example.com/app/730", "https://discord.gg/python"):
+            with self.assertRaises(ValueError, msg=bad):
+                n(bad)
+
+    def test_detection(self):
+        self.assertEqual([p.id for p in cli.detect_providers("https://store.steampowered.com/app/730/CounterStrike_2/")], ["steam.players"])
+        self.assertEqual([p.id for p in cli.detect_providers("730")], ["steam.players"])
+        # A digits-only YouTube handle is still reachable, written with its @.
+        self.assertEqual(youtube.normalize_channel("@730"), "@730")
+        self.assertEqual([p.id for p in cli.detect_providers("@730")], ["youtube.subscribers"])
+        # An eleven-character id is a YouTube video, never a Steam app.
+        self.assertNotIn("steam.players", [p.id for p in cli.detect_providers("12345678901")])
+        self.assertNotIn("steam.players", [p.id for p in cli.detect_providers("dQw4w9WgXcQ")])
+
+    def test_fetch_and_errors(self):
+        calls = []
+
+        def fake_http(url, timeout=10, headers=None):
+            calls.append(url)
+            if "GetNumberOfCurrentPlayers" in url:
+                if "appid=999" in url:
+                    raise base.HttpError(404, "")
+                return {"response": {"player_count": 774957, "result": 1}}
+            if "appdetails" in url:
+                if "appids=555" in url:
+                    return {"555": {"success": False}}
+                # Keyed by an id of the store's choosing, as the real thing is.
+                return {"2678630": {"success": True, "data": {"type": "game", "name": "Counter-Strike 2", "steam_appid": 730}}}
+            raise AssertionError(url)
+
+        saved = steam.http_json
+        steam.http_json = fake_http
+        self.addCleanup(setattr, steam, "http_json", saved)
+        rows = cli.fetch_all([{"type": "steam.players", "target": "https://store.steampowered.com/app/730/CounterStrike_2/"},
+                              {"type": "steam.players", "target": "999"},
+                              {"type": "steam.players", "target": "555"}], now=0)["counters"]
+        self.assertEqual((rows[0]["value"], rows[0]["name"], rows[0]["url"], rows[0]["target"]),
+                         (774957, "Counter-Strike 2", "https://store.steampowered.com/app/730", "730"))
+        self.assertEqual(rows[0]["tooltip"], "Counter-Strike 2\n774,957 playing now")
+        self.assertEqual(rows[1]["error"], "no Steam app with id 999")
+        # A store that will not say the name still gives the count.
+        self.assertEqual((rows[2]["value"], rows[2]["name"]), (774957, "Steam app 555"))
+        self.assertEqual((rows[0]["group"], rows[0]["groupLabel"], rows[0]["brandColor"]), ("steam", "Steam", ""))
+        self.assertTrue(all(u.startswith("https://") for u in calls))
 
 
 class Mastodon(Sandbox):
@@ -1099,6 +1152,14 @@ class LiveKeyless(unittest.TestCase):
         self.assertEqual(result.name.lower(), "#tunetuesday")
         people = cli.PROVIDERS["mastodon.tagpeople"].fetch("#TuneTuesday@mastodon.social", {})
         self.assertGreaterEqual(people.value, 0)
+
+    def test_steam(self):
+        result = cli.PROVIDERS["steam.players"].fetch("730", {})
+        self.assertGreater(result.value, 10_000)
+        self.assertEqual(result.name, "Counter-Strike 2")
+        with self.assertRaises(cli.CounterError) as caught:
+            cli.PROVIDERS["steam.players"].fetch("999999999", {})
+        self.assertIn("no Steam app", str(caught.exception))
 
     def test_discord(self):
         members = cli.PROVIDERS["discord.members"].fetch("discord.gg/python", {})
