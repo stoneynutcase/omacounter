@@ -143,7 +143,7 @@ counters added before this.
 | `glyphColor` | the glyph on its own, same values; beats `color`. Unset, a source's brand colour applies (YouTube red) |
 | `textColor` | the number on its own, same values; beats `color` |
 | `interval` | minutes between fetches for this counter; defaults to the widget's `refreshMinutes`, and can never go below the source's rate cap (see `types`) |
-| `icon` | glyph before the number; defaults per type (󰗃 subscribers, 󰔓 likes, 󰛐 views, 󰓎 stars, 󰀨 issues, 󰓂 pull requests, 󰇚 cloners, 󰫑 Mastodon account, 󰐣 Mastodon tag, 󰙯 Discord members, 󰐰 Discord online) |
+| `icon` | glyph before the number; defaults per type (󰗃 subscribers, 󰔓 likes, 󰛐 views, 󰓎 stars, 󰀨 issues, 󰓂 pull requests, 󰇚 cloners, 󰫑 Mastodon account, 󰐣 Mastodon tag, 󰙯 Discord members, 󰡉 Discord online) |
 | `bar` | `false` keeps the counter off the bar; it stays in the panel, dimmed. `omacounter set 3 bar off`, or the 󰛐 on the panel row |
 
 ### Widget settings

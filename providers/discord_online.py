@@ -8,7 +8,7 @@ class DiscordOnline(Provider):
     id = "discord.online"
     label = "Discord online"
     unit = "online now"
-    icon = "\U000F0430"  # nf-md-pulse: a live signal, apart from the members' Discord mark
+    icon = "\U000F0849"  # nf-md-account-group: the people online, apart from the members' Discord mark
     brand_color = discord.BRAND_COLOR
     target_help = "invite link (discord.gg/<code>)"
     target_kind = "Discord server"
