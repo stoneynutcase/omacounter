@@ -211,6 +211,18 @@ Panel {
        ? listColumn.implicitHeight + Style.space(12) * 2 + footerSeparator.height + footerRow.implicitHeight
        : emptyState.implicitHeight)
 
+  // A clock the "fetched 5 minutes ago" captions bind to, so they move on
+  // while the panel is open rather than freezing at the last report.
+  property real clockNow: Date.now()
+
+  Timer {
+    interval: 30 * 1000
+    running: root.opened
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.clockNow = Date.now()
+  }
+
   // ---- open / close -----------------------------------------------------------
   // Bumped when the cards should reset to zero and count up again: the first
   // open of a session (nothing earlier to move from) and a hard refresh.
@@ -1391,7 +1403,7 @@ Panel {
                         text: row.modelData.error
                           ? (row.hasValue ? "stale · " : "") + row.modelData.error + Model.retryCaption(row.modelData)
                           : (Model.deltaCaption(row.modelData) || (row.modelData.unit ? row.modelData.unit : ""))
-                            + (row.modelData.rateLimited ? Model.rateLimitCaption(row.modelData) : "")
+                            + (row.modelData.rateLimited ? Model.rateLimitCaption(row.modelData, root.clockNow) : "")
                         color: row.modelData.error ? root.urgentColor : root.dimmer
                         font.family: root.fontFam
                         font.pixelSize: Style.font.caption

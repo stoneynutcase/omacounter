@@ -194,7 +194,7 @@ counter for a day.
 
 Every source declares how often it may be polled, and that cap holds whatever
 a counter or the widget asks for — a hard refresh inside the cap shows the
-cached number and says when the next fetch is. `omacounter types` prints
+cached number and says how long ago it was fetched. `omacounter types` prints
 each cap and why:
 
 - **YouTube**: at most every minute. Each fetch of one counter costs one unit

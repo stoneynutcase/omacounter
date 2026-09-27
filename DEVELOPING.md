@@ -172,7 +172,7 @@ prints
 A counter is fetched when it has never been, when its effective interval has
 elapsed, or under `--force` — except that a provider's `min_interval` (its
 rate cap) always holds: a forced fetch inside the cap serves the cached
-value and sets `rateLimited`, and the panel says when the next fetch is. The
+value and sets `rateLimited`, and the panel says how long ago it was fetched. The
 effective interval is the counter's `interval`, else the provider's
 `default_interval`, else `--max-age`, raised to `min_interval`. A failed
 fetch keeps the last good `value`, sets `error`, and is retried after two

@@ -65,9 +65,18 @@ test("bar items and tick", () => {
 })
 
 test("rate limit caption", () => {
-  assert.equal(Model.rateLimitCaption({ rateLimited: false }), "")
-  assert.equal(Model.rateLimitCaption({ rateLimited: true, fetchedAt: "2026-09-22T12:04:00", nextFetchAt: "2026-09-22T12:09:00" }), " · fetched 12:04, next 12:09")
-  assert.equal(Model.rateLimitCaption({ rateLimited: true, fetchedAt: "", nextFetchAt: "2026-09-22T12:09:00" }), " · next 12:09")
+  const now = Date.parse("2026-09-22T12:09:30")
+  assert.equal(Model.rateLimitCaption({ rateLimited: false }, now), "")
+  assert.equal(Model.rateLimitCaption({ rateLimited: true, fetchedAt: "2026-09-22T12:04:00", nextFetchAt: "2026-09-22T12:09:00" }, now), " · fetched 5 minutes ago")
+  assert.equal(Model.rateLimitCaption({ rateLimited: true, fetchedAt: "", nextFetchAt: "2026-09-22T12:09:00" }, now), "")
+  // Humanized ages
+  assert.equal(Model.ago("2026-09-22T12:09:00", now), "just now")
+  assert.equal(Model.ago("2026-09-22T12:08:00", now), "1 minute ago")
+  assert.equal(Model.ago("2026-09-22T11:09:00", now), "1 hour ago")
+  assert.equal(Model.ago("2026-09-22T09:00:00", now), "3 hours ago")
+  assert.equal(Model.ago("2026-09-20T12:09:00", now), "2 days ago")
+  assert.equal(Model.ago("2026-09-22T12:10:00", now), "just now")   // a clock a step ahead
+  assert.equal(Model.ago("", now), "")
 })
 
 test("retry caption", () => {
