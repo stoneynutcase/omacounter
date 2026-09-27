@@ -8,7 +8,7 @@ class SteamPlayers(Provider):
     id = "steam.players"
     label = "Steam players"
     unit = "playing now"
-    icon = "\U000F04A3"  # nf-md-steam
+    icon = "\uF1B6"  # nf-fa-steam (U+F04A3, the "md" guess, is the silverware)
     brand_color = steam.BRAND_COLOR
     target_help = "store URL or app id"
     target_kind = "Steam game"

@@ -464,7 +464,7 @@ class Steam(Sandbox):
         self.assertEqual(rows[1]["error"], "no Steam app with id 999")
         # A store that will not say the name still gives the count.
         self.assertEqual((rows[2]["value"], rows[2]["name"]), (774957, "Steam app 555"))
-        self.assertEqual((rows[0]["group"], rows[0]["groupLabel"], rows[0]["brandColor"]), ("steam", "Steam", "#66C0F4"))
+        self.assertEqual((rows[0]["group"], rows[0]["groupLabel"], rows[0]["brandColor"]), ("steam", "Steam", "#1A9FFF"))
         self.assertTrue(all(u.startswith("https://") for u in calls))
 
 
