@@ -4,8 +4,9 @@ Hit counters for the [Omarchy](https://omarchy.org/) bar. Remember the visitor
 counter at the bottom of every home page? This is that, for the numbers you
 care about today: YouTube channel subscribers, video likes and views, GitHub
 stars, open issues, pull requests and unique cloners, Mastodon followers,
-posts and hashtag activity, Discord server members and members online — and
-more are coming, since every source is one small file.
+posts and hashtag activity, Discord server members and members online,
+Steam players in a game right now — and more are coming, since every source
+is one small file.
 
 ![Omacounter: the counters on the bar and the panel below it](preview.png)
 
@@ -30,8 +31,8 @@ counting every card up from zero, and monochrome switched on:
 - `python3` — on a stock Omarchy
 - For YouTube counters, a free [YouTube Data API v3](https://console.cloud.google.com/apis/library/youtube.googleapis.com)
   key. Setup walks you through it; it takes about two minutes and only reads
-  public statistics. Mastodon and Discord counters and GitHub stars, issues
-  and pull requests need nothing. GitHub unique cloners need a token that can read
+  public statistics. Mastodon, Discord and Steam counters and GitHub stars,
+  issues and pull requests need nothing. GitHub unique cloners need a token that can read
   the repository; a logged-in `gh` CLI counts when it is the system package
   (`/usr/bin/gh`), so on most developer machines nothing has to be stored.
 
@@ -76,6 +77,7 @@ omacounter add mastodon.followers Gargron@mastodon.social
 omacounter add https://mastodon.social/tags/TuneTuesday     # asks: posts or people this week?
 omacounter add https://discord.gg/python                    # asks: members or online now?
 omacounter add discord.members discord.gg/python            # a permanent invite link
+omacounter add https://store.steampowered.com/app/730/      # Steam: players in the game now
 omacounter add youtube.subscribers @omarchy
 omacounter add youtube.likes https://www.youtube.com/watch?v=dQw4w9WgXcQ
 omacounter add github.stars https://github.com/octocat/Hello-World
@@ -103,7 +105,7 @@ its section. To change the order, hover a row in the panel and drag it by
 the `󰍜` handle at its start; a row stays within its section. Hover a section
 title and drag its handle to move the whole section. On the command line,
 `move <n|target> up|down|top|bottom` moves a counter within its section and
-`move <youtube|github|mastodon|discord> up|down|top|bottom` moves a section. The
+`move <youtube|github|mastodon|discord|steam> up|down|top|bottom` moves a section. The
 numbers `list` prints, and that `set`, `move` and
 `remove` take, are positions in this order, and any change the command line
 makes stores the list in it, so `shell.json` ends up reading the way the
@@ -135,15 +137,15 @@ counters added before this.
 
 | Key | Meaning |
 | --- | --- |
-| `type` | `youtube.subscribers`, `youtube.likes`, `youtube.views`, `github.stars`, `github.issues`, `github.pulls`, `github.clones`, `mastodon.followers`, `mastodon.posts`, `mastodon.tag`, `mastodon.tagpeople`, `discord.members`, `discord.online` (`omacounter types` lists them with what each needs) |
-| `target` | the channel (`@handle`, `UC…` id or URL), the video (id or URL), the repository (`owner/repo` or URL), the account (`user@instance` or profile URL), the tag (`#tag@instance` or tag URL), or the Discord invite link (`discord.gg/<code>`, a permanent one) |
+| `type` | `youtube.subscribers`, `youtube.likes`, `youtube.views`, `github.stars`, `github.issues`, `github.pulls`, `github.clones`, `mastodon.followers`, `mastodon.posts`, `mastodon.tag`, `mastodon.tagpeople`, `discord.members`, `discord.online`, `steam.players` (`omacounter types` lists them with what each needs) |
+| `target` | the channel (`@handle`, `UC…` id or URL), the video (id or URL), the repository (`owner/repo` or URL), the account (`user@instance` or profile URL), the tag (`#tag@instance` or tag URL), the Discord invite link (`discord.gg/<code>`, a permanent one), or the Steam game (store URL or app id) |
 | `label` | name in the panel and tooltip; defaults to the channel, video, repository, account or tag name. `omacounter set 1 label "…"`, or the 󰏫 on the panel row |
 | `style` | `short` (12.3K) or `long` (12,345) on the bar; defaults to the widget's `style` |
 | `color` | glyph and number together: `foreground` (default), `accent`, `urgent`, `muted`, or `#rrggbb`; theme roles follow the theme. Setting it drops the counter's `glyphColor` and `textColor` |
 | `glyphColor` | the glyph on its own, same values; beats `color`. Unset, a source's brand colour applies (YouTube red) |
 | `textColor` | the number on its own, same values; beats `color` |
 | `interval` | minutes between fetches for this counter; defaults to the widget's `refreshMinutes`, and can never go below the source's rate cap (see `types`) |
-| `icon` | glyph before the number; defaults per type (󰗃 subscribers, 󰔓 likes, 󰛐 views, 󰓎 stars, 󰀨 issues, 󰓂 pull requests, 󰇚 cloners, 󰫑 Mastodon account, 󰐣 Mastodon tag, 󰙯 Discord members, 󰡉 Discord online) |
+| `icon` | glyph before the number; defaults per type (󰗃 subscribers, 󰔓 likes, 󰛐 views, 󰓎 stars, 󰀨 issues, 󰓂 pull requests, 󰇚 cloners, 󰫑 Mastodon account, 󰐣 Mastodon tag, 󰙯 Discord members, 󰡉 Discord online, 󰒣 Steam) |
 | `bar` | `false` keeps the counter off the bar; it stays in the panel, dimmed. `omacounter set 3 bar off`, or the 󰛐 on the panel row |
 
 ### Widget settings
@@ -212,11 +214,15 @@ each cap and why:
 - **Discord**: at most every 5 minutes. The invite route answers without a
   token and publishes no limits; Discord itself refreshes the counts about
   once a minute, so asking more often buys nothing.
+- **Steam**: at most every 5 minutes. The player count comes from the Web
+  API and the game's name from the store, which answers about 200 requests
+  per 5 minutes per address.
 
-The Mastodon tag types and Discord's online count are the exceptions to "a
-number that only goes up": an instance publishes a tag's last seven days,
+The Mastodon tag types, Discord's online count and Steam's players are the
+exceptions to "a number that only goes up": an instance publishes a tag's last seven days,
 so posts-this-week and people-this-week are a rolling window and drop as
-days fall off the back, and members online rises and falls with the day.
+days fall off the back, and members online and players in a game rise and
+fall with the day.
 The flip display handles that the way a real one would, by rolling forward
 past 9.
 
@@ -268,8 +274,9 @@ should say exactly how far it reaches. In full:
 
 - **Network** — only the services behind the counters you configured:
   `www.googleapis.com` for YouTube, `api.github.com` for GitHub,
-  `discord.com` for Discord, and for Mastodon the instance named in the
-  counter. Every request is https to a
+  `discord.com` for Discord, `api.steampowered.com` and
+  `store.steampowered.com` for Steam, and for Mastodon the instance named in
+  the counter. Every request is https to a
   fixed address built by the source's own file; a redirect is followed only
   to another https address, three hops at most; answers are capped at one
   megabyte and ten seconds. No analytics, no telemetry, no other host.

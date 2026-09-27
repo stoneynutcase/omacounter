@@ -18,6 +18,8 @@ providers/               one file per counter type, plus shared modules
   mastodon_followers.py  mastodon_posts.py  mastodon_tag.py  mastodon_tagpeople.py
   discord.py             shared Discord code: invite link parser, the public invite lookup
   discord_members.py     discord_online.py
+  steam.py               shared Steam code: app address parser, the player count and store name lookups
+  steam_players.py
 Panel.qml                the popup and the fetch process; derives what the bar face shows
 BarWidget.qml            the bar entry point: paints the entries the panel hands it
 FlipDigit.qml            one split-flap card
