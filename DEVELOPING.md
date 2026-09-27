@@ -16,6 +16,8 @@ providers/               one file per counter type, plus shared modules
   youtube_subscribers.py youtube_likes.py  youtube_views.py
   github_stars.py        github_issues.py  github_pulls.py  github_clones.py
   mastodon_followers.py  mastodon_posts.py  mastodon_tag.py  mastodon_tagpeople.py
+  discord.py             shared Discord code: invite link parser, the public invite lookup
+  discord_members.py     discord_online.py
 Panel.qml                the popup and the fetch process; derives what the bar face shows
 BarWidget.qml            the bar entry point: paints the entries the panel hands it
 FlipDigit.qml            one split-flap card
