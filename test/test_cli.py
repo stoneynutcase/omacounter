@@ -38,9 +38,9 @@ cli = load_cli()
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 import providers  # noqa: E402
-from providers import base, github, mastodon, youtube  # noqa: E402
+from providers import base, discord, github, mastodon, youtube  # noqa: E402
 
-SHARED_MODULES = {"base.py", "youtube.py", "mastodon.py", "github.py"}
+SHARED_MODULES = {"base.py", "youtube.py", "mastodon.py", "github.py", "discord.py"}
 
 
 class Sandbox(unittest.TestCase):
@@ -89,7 +89,8 @@ class Discovery(unittest.TestCase):
     def test_registry(self):
         self.assertEqual(set(cli.PROVIDERS), {"github.stars", "github.issues", "github.pulls", "github.clones",
                                               "mastodon.followers", "mastodon.posts", "mastodon.tag", "mastodon.tagpeople",
-                                              "youtube.subscribers", "youtube.likes", "youtube.views"})
+                                              "youtube.subscribers", "youtube.likes", "youtube.views",
+                                              "discord.members", "discord.online"})
         self.assertEqual(providers.LOAD_ERRORS, [])
         self.assertEqual(list(cli.PROVIDERS)[:4], ["github.stars", "github.issues", "github.pulls", "github.clones"])  # `order`, then file name
 
@@ -356,6 +357,62 @@ class GitHub(Sandbox):
 
 
 # ------------------------------------------------------------------- mastodon
+
+
+class Discord(Sandbox):
+    INVITE = {"code": "python", "expires_at": None,
+              "guild": {"id": "267624335836053506", "name": "Python"},
+              "approximate_member_count": 431914, "approximate_presence_count": 32163}
+
+    def test_normalize(self):
+        n = discord.normalize_invite
+        for raw in ("discord.gg/python", "https://discord.gg/python", "https://discord.gg/python/",
+                    "https://discord.com/invite/python", "discordapp.com/invite/python", "https://www.discord.gg/python"):
+            self.assertEqual(n(raw), "discord.gg/python", raw)
+        self.assertEqual(n("https://discord.gg/aBc-123"), "discord.gg/aBc-123")
+        # A bare code is not a target: on its own it could be anything.
+        for bad in ("", "python", "dQw4w9WgXcQ", "@omarchy", "octocat/Hello-World", "https://discord.com/channels/1/2",
+                    "https://discord.gg/", "https://discord.gg/a/b", "https://discord.com/python", "https://example.com/invite/x"):
+            with self.assertRaises(ValueError, msg=bad):
+                n(bad)
+
+    def test_detection_offers_both_metrics_and_nothing_else(self):
+        for raw in ("https://discord.gg/python", "discord.gg/python", "https://discord.com/invite/python"):
+            self.assertEqual([p.id for p in cli.detect_providers(raw)], ["discord.members", "discord.online"], raw)
+        self.assertNotIn("discord.members", [p.id for p in cli.detect_providers("dQw4w9WgXcQ")])
+        self.assertNotIn("discord.members", [p.id for p in cli.detect_providers("https://mastodon.social/@Gargron")])
+
+    def test_fetch_and_errors(self):
+        calls = []
+
+        def fake_http(url, timeout=10, headers=None):
+            calls.append(url)
+            if "/invites/gone" in url:
+                raise base.HttpError(404, "Unknown Invite")
+            if "/invites/temp" in url:
+                return dict(self.INVITE, expires_at="2026-10-01T00:00:00+00:00")
+            if "/invites/group" in url:
+                return {"code": "group", "expires_at": None, "channel": {"name": "dm"}}
+            return dict(self.INVITE)
+
+        saved = discord.http_json
+        discord.http_json = fake_http
+        self.addCleanup(setattr, discord, "http_json", saved)
+        rows = cli.fetch_all([{"type": "discord.members", "target": "https://discord.gg/python"},
+                              {"type": "discord.online", "target": "discord.gg/python"},
+                              {"type": "discord.members", "target": "discord.gg/gone"},
+                              {"type": "discord.members", "target": "discord.gg/temp"},
+                              {"type": "discord.online", "target": "discord.gg/group"}], now=0)["counters"]
+        self.assertEqual((rows[0]["value"], rows[0]["name"], rows[0]["url"]), (431914, "Python", "https://discord.gg/python"))
+        self.assertEqual(rows[0]["target"], "discord.gg/python")
+        self.assertEqual((rows[1]["value"], rows[1]["unit"]), (32163, "online now"))
+        self.assertEqual(rows[0]["tooltip"], "Python\n431,914 members")
+        self.assertEqual(rows[2]["error"], "invite not found (revoked, expired, or mistyped)")
+        self.assertIn("expires (2026-10-01)", rows[3]["error"])
+        self.assertIn("does not lead to a server", rows[4]["error"])
+        self.assertEqual((rows[0]["group"], rows[0]["groupLabel"], rows[0]["brandColor"]), ("discord", "Discord", "#5865F2"))
+        self.assertTrue(all(u.startswith("https://discord.com/api/v10/invites/") and "with_counts=true" in u for u in calls))
+        self.assertEqual((rows[0]["minInterval"], rows[0]["effectiveInterval"]), (5, 15))
 
 
 class Mastodon(Sandbox):
@@ -1042,6 +1099,16 @@ class LiveKeyless(unittest.TestCase):
         self.assertEqual(result.name.lower(), "#tunetuesday")
         people = cli.PROVIDERS["mastodon.tagpeople"].fetch("#TuneTuesday@mastodon.social", {})
         self.assertGreaterEqual(people.value, 0)
+
+    def test_discord(self):
+        members = cli.PROVIDERS["discord.members"].fetch("discord.gg/python", {})
+        online = cli.PROVIDERS["discord.online"].fetch("discord.gg/python", {})
+        self.assertGreater(members.value, 100_000)
+        self.assertGreater(online.value, 1000)
+        self.assertEqual(members.name, "Python")
+        with self.assertRaises(cli.CounterError) as caught:
+            cli.PROVIDERS["discord.members"].fetch("discord.gg/no-such-invite-xyz987", {})
+        self.assertIn("not found", str(caught.exception))
 
     def test_end_to_end_report(self):
         # The CLI's fetch loop over three sources at once, from an empty

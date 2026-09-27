@@ -16,6 +16,8 @@ providers/               one file per counter type, plus shared modules
   youtube_subscribers.py youtube_likes.py  youtube_views.py
   github_stars.py        github_issues.py  github_pulls.py  github_clones.py
   mastodon_followers.py  mastodon_posts.py  mastodon_tag.py  mastodon_tagpeople.py
+  discord.py             shared Discord code: invite link parser, the public invite lookup
+  discord_members.py     discord_online.py
 Panel.qml                the popup and the fetch process; derives what the bar face shows
 BarWidget.qml            the bar entry point: paints the entries the panel hands it
 FlipDigit.qml            one split-flap card
@@ -170,7 +172,7 @@ prints
 A counter is fetched when it has never been, when its effective interval has
 elapsed, or under `--force` — except that a provider's `min_interval` (its
 rate cap) always holds: a forced fetch inside the cap serves the cached
-value and sets `rateLimited`, and the panel says when the next fetch is. The
+value and sets `rateLimited`, and the panel says how long ago it was fetched. The
 effective interval is the counter's `interval`, else the provider's
 `default_interval`, else `--max-age`, raised to `min_interval`. A failed
 fetch keeps the last good `value`, sets `error`, and is retried after two

@@ -4,8 +4,8 @@ Hit counters for the [Omarchy](https://omarchy.org/) bar. Remember the visitor
 counter at the bottom of every home page? This is that, for the numbers you
 care about today: YouTube channel subscribers, video likes and views, GitHub
 stars, open issues, pull requests and unique cloners, Mastodon followers,
-posts and hashtag activity — and more are coming, since every source is one
-small file.
+posts and hashtag activity, Discord server members and members online — and
+more are coming, since every source is one small file.
 
 ![Omacounter: the counters on the bar and the panel below it](preview.png)
 
@@ -30,8 +30,8 @@ counting every card up from zero, and monochrome switched on:
 - `python3` — on a stock Omarchy
 - For YouTube counters, a free [YouTube Data API v3](https://console.cloud.google.com/apis/library/youtube.googleapis.com)
   key. Setup walks you through it; it takes about two minutes and only reads
-  public statistics. Mastodon counters and GitHub stars, issues and pull
-  requests need nothing. GitHub unique cloners need a token that can read
+  public statistics. Mastodon and Discord counters and GitHub stars, issues
+  and pull requests need nothing. GitHub unique cloners need a token that can read
   the repository; a logged-in `gh` CLI counts when it is the system package
   (`/usr/bin/gh`), so on most developer machines nothing has to be stored.
 
@@ -74,6 +74,8 @@ omacounter add github.clones stoneynutcase/omagif           # a repository you c
 omacounter add https://mastodon.social/@Gargron             # asks: followers or posts?
 omacounter add mastodon.followers Gargron@mastodon.social
 omacounter add https://mastodon.social/tags/TuneTuesday     # asks: posts or people this week?
+omacounter add https://discord.gg/python                    # asks: members or online now?
+omacounter add discord.members discord.gg/python            # a permanent invite link
 omacounter add youtube.subscribers @omarchy
 omacounter add youtube.likes https://www.youtube.com/watch?v=dQw4w9WgXcQ
 omacounter add github.stars https://github.com/octocat/Hello-World
@@ -101,7 +103,7 @@ its section. To change the order, hover a row in the panel and drag it by
 the `󰍜` handle at its start; a row stays within its section. Hover a section
 title and drag its handle to move the whole section. On the command line,
 `move <n|target> up|down|top|bottom` moves a counter within its section and
-`move <youtube|github|mastodon> up|down|top|bottom` moves a section. The
+`move <youtube|github|mastodon|discord> up|down|top|bottom` moves a section. The
 numbers `list` prints, and that `set`, `move` and
 `remove` take, are positions in this order, and any change the command line
 makes stores the list in it, so `shell.json` ends up reading the way the
@@ -133,15 +135,15 @@ counters added before this.
 
 | Key | Meaning |
 | --- | --- |
-| `type` | `youtube.subscribers`, `youtube.likes`, `youtube.views`, `github.stars`, `github.issues`, `github.pulls`, `github.clones`, `mastodon.followers`, `mastodon.posts`, `mastodon.tag`, `mastodon.tagpeople` (`omacounter types` lists them with what each needs) |
-| `target` | the channel (`@handle`, `UC…` id or URL), the video (id or URL), the repository (`owner/repo` or URL), the account (`user@instance` or profile URL), or the tag (`#tag@instance` or tag URL) |
+| `type` | `youtube.subscribers`, `youtube.likes`, `youtube.views`, `github.stars`, `github.issues`, `github.pulls`, `github.clones`, `mastodon.followers`, `mastodon.posts`, `mastodon.tag`, `mastodon.tagpeople`, `discord.members`, `discord.online` (`omacounter types` lists them with what each needs) |
+| `target` | the channel (`@handle`, `UC…` id or URL), the video (id or URL), the repository (`owner/repo` or URL), the account (`user@instance` or profile URL), the tag (`#tag@instance` or tag URL), or the Discord invite link (`discord.gg/<code>`, a permanent one) |
 | `label` | name in the panel and tooltip; defaults to the channel, video, repository, account or tag name. `omacounter set 1 label "…"`, or the 󰏫 on the panel row |
 | `style` | `short` (12.3K) or `long` (12,345) on the bar; defaults to the widget's `style` |
 | `color` | glyph and number together: `foreground` (default), `accent`, `urgent`, `muted`, or `#rrggbb`; theme roles follow the theme. Setting it drops the counter's `glyphColor` and `textColor` |
 | `glyphColor` | the glyph on its own, same values; beats `color`. Unset, a source's brand colour applies (YouTube red) |
 | `textColor` | the number on its own, same values; beats `color` |
 | `interval` | minutes between fetches for this counter; defaults to the widget's `refreshMinutes`, and can never go below the source's rate cap (see `types`) |
-| `icon` | glyph before the number; defaults per type (󰗃 subscribers, 󰔓 likes, 󰛐 views, 󰓎 stars, 󰀨 issues, 󰓂 pull requests, 󰇚 cloners, 󰫑 Mastodon account, 󰐣 Mastodon tag) |
+| `icon` | glyph before the number; defaults per type (󰗃 subscribers, 󰔓 likes, 󰛐 views, 󰓎 stars, 󰀨 issues, 󰓂 pull requests, 󰇚 cloners, 󰫑 Mastodon account, 󰐣 Mastodon tag, 󰙯 Discord members, 󰡉 Discord online) |
 | `bar` | `false` keeps the counter off the bar; it stays in the panel, dimmed. `omacounter set 3 bar off`, or the 󰛐 on the panel row |
 
 ### Widget settings
@@ -192,7 +194,7 @@ counter for a day.
 
 Every source declares how often it may be polled, and that cap holds whatever
 a counter or the widget asks for — a hard refresh inside the cap shows the
-cached number and says when the next fetch is. `omacounter types` prints
+cached number and says how long ago it was fetched. `omacounter types` prints
 each cap and why:
 
 - **YouTube**: at most every minute. Each fetch of one counter costs one unit
@@ -207,10 +209,14 @@ each cap and why:
   14-day window like GitHub's own Insights → Traffic page.
 - **Mastodon**: at most every 5 minutes. A default instance allows 300
   requests per 5 minutes per IP, but it is somebody's server; be polite.
+- **Discord**: at most every 5 minutes. The invite route answers without a
+  token and publishes no limits; Discord itself refreshes the counts about
+  once a minute, so asking more often buys nothing.
 
-The Mastodon tag types are the one exception to "a number that only goes
-up": an instance publishes a tag's last seven days, so posts-this-week and
-people-this-week are a rolling window and drop as days fall off the back.
+The Mastodon tag types and Discord's online count are the exceptions to "a
+number that only goes up": an instance publishes a tag's last seven days,
+so posts-this-week and people-this-week are a rolling window and drop as
+days fall off the back, and members online rises and falls with the day.
 The flip display handles that the way a real one would, by rolling forward
 past 9.
 
@@ -261,8 +267,9 @@ A widget that holds an API key and talks to the internet every few minutes
 should say exactly how far it reaches. In full:
 
 - **Network** — only the services behind the counters you configured:
-  `www.googleapis.com` for YouTube, `api.github.com` for GitHub, and for
-  Mastodon the instance named in the counter. Every request is https to a
+  `www.googleapis.com` for YouTube, `api.github.com` for GitHub,
+  `discord.com` for Discord, and for Mastodon the instance named in the
+  counter. Every request is https to a
   fixed address built by the source's own file; a redirect is followed only
   to another https address, three hops at most; answers are capped at one
   megabyte and ten seconds. No analytics, no telemetry, no other host.

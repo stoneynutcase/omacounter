@@ -48,7 +48,7 @@ concurrency:
 
 jobs:
   keyless:
-    name: GitHub and Mastodon
+    name: GitHub, Mastodon and Discord
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -97,10 +97,12 @@ jobs:
               "Where to look first:",
               "",
               "- **GitHub and Mastodon** fetch public numbers for octocat/Hello-World,",
-              "  Gargron@mastodon.social and #TuneTuesday@mastodon.social, and run the",
-              "  CLI's fetch loop end to end. A failure there means a response shape",
-              "  changed, or a rate limit hit (GitHub's search endpoint allows 30 a",
-              "  minute with a token).",
+              "  Gargron@mastodon.social, #TuneTuesday@mastodon.social and the Discord",
+              "  invite discord.gg/python, and run the CLI's fetch loop end to end. A",
+              "  failure there means a response shape changed, or a rate limit hit",
+              "  (GitHub's search endpoint allows 30 a minute with a token). For Discord,",
+              "  `test_discord` failing on its own means the public invite route",
+              "  (`/api/v10/invites/<code>?with_counts=true`) changed or now needs a token.",
               "- **YouTube (API)** calls the Data API with the `YOUTUBE_API_KEY` secret.",
               "  If only that job failed, check the key is still valid and the day's",
               "  10,000-unit quota is not used up before suspecting the code.",

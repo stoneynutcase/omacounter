@@ -137,14 +137,28 @@ function tickMinutes(counters, refreshMinutes) {
   return minutes
 }
 
-// " · fetched 12:04, next 12:09": a hard refresh landed inside the
-// provider's rate cap, so the number shown is the cached one.
-function rateLimitCaption(c) {
+// "just now", "5 minutes ago", "3 hours ago", "2 days ago": how long ago
+// an ISO local timestamp was, as of `now` (milliseconds; defaults to the
+// clock).
+function ago(iso, now) {
+  var t = Date.parse(String(iso || ""))
+  if (isNaN(t)) return ""
+  var seconds = Math.max(0, Math.round(((now === undefined ? Date.now() : now) - t) / 1000))
+  if (seconds < 60) return "just now"
+  var units = [["day", 86400], ["hour", 3600], ["minute", 60]]
+  for (var i = 0; i < units.length; i++) {
+    var n = Math.floor(seconds / units[i][1])
+    if (n >= 1) return n + " " + units[i][0] + (n === 1 ? "" : "s") + " ago"
+  }
+  return "just now"
+}
+
+// " · fetched 5 minutes ago": a hard refresh landed inside the provider's
+// rate cap, so the number shown is the cached one.
+function rateLimitCaption(c, now) {
   if (!c || !c.rateLimited) return ""
-  var fetched = timeLabel(c.fetchedAt)
-  var next = timeLabel(c.nextFetchAt)
-  if (!fetched && !next) return ""
-  return " · " + (fetched ? "fetched " + fetched : "") + (fetched && next ? ", " : "") + (next ? "next " + next : "")
+  var when = ago(c.fetchedAt, now)
+  return when ? " · fetched " + when : ""
 }
 
 // " · retry 12:09": when a failed counter is tried again.
@@ -288,6 +302,7 @@ if (typeof module !== "undefined") {
     tooltip: tooltip,
     entryTooltip: entryTooltip,
     tickMinutes: tickMinutes,
+    ago: ago,
     rateLimitCaption: rateLimitCaption,
     retryCaption: retryCaption,
     groupRows: groupRows,

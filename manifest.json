@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "stoneynutcase.omacounter",
   "name": "Omacounter",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "author": "stoneynutcase",
   "license": "MIT",
-  "description": "Old-school hit counters in the Omarchy bar: YouTube subscribers, video likes and views, GitHub stars, issues, pull requests and cloners, Mastodon followers, posts and hashtag activity. More counters are coming; every source is one small file.",
+  "description": "Old-school hit counters in the Omarchy bar: YouTube subscribers, video likes and views, GitHub stars, issues, pull requests and cloners, Mastodon followers, posts and hashtag activity, Discord server members and members online. More counters are coming; every source is one small file.",
   "kinds": [
     "bar-widget"
   ],
